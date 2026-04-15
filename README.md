@@ -1,6 +1,6 @@
-# GateJumper (Generic Template)
+# GateJumper
 
-A clean, injection-based CrackProof bypass for running Unity Engine games flawlessly on Linux running under Wine/Proton.
+A clean, injection-based CrackProof bypass for running Unity Engine games on Linux running under Wine/Proton.
 
 ## How it Works
 
@@ -15,10 +15,6 @@ Rather than trying to neuter the RPC checks, modify API imports dynamically, or 
 5. The payload in `gatejumper.dll` bypasses CrackProof, completely ignores the protective `.bind` routine, fetches the `UnityMain` pipeline organically via `LoadLibrary`, and starts the generic engine sequence unmodified.
 
 ## Building & Deploying
-
-1. Open `injector/src/main.rs`.
-2. Locate the static `REAL_GAME_EXE` definition and modify it to match your target game's binary name:
-   `const REAL_GAME_EXE: &str = "<INSERT_GAME_EXECUTABLE_HERE.exe>";`
 
 ```bash
 # Build the injector (the starter binary)

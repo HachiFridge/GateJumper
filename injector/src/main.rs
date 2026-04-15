@@ -1,11 +1,11 @@
 //! GateJumper Injector
 //!
-//! Launches the target crackproof-enabled executable in a SUSPENDED state, injects
+//! Launches the target CrackProof-enabled executable in a SUSPENDED state, injects
 //! the GateJumper gatejumper.dll (which hard-hijacks the entry point and executes UnityMain),
 //! then resumes the process. This ensures our hooks are in place BEFORE CrackProof's
 //! unpacker code runs, preventing the anti-cheat from terminating the game natively.
 //!
-//! Configure the `REAL_GAME_EXE` variable below to match your target game.
+//! The injector will automatically detect the game executable within the same directory.
 
 #![windows_subsystem = "windows"]
 #![allow(non_snake_case, unused_variables)]
@@ -112,8 +112,6 @@ const MEM_COMMIT: DWORD = 0x00001000;
 const MEM_RESERVE: DWORD = 0x00002000;
 const PAGE_READWRITE: DWORD = 0x04;
 
-/// The original game exe, renamed so our injector can take its filename
-const REAL_GAME_EXE: &str = "<INSERT_GAME_EXECUTABLE_HERE.exe>";
 /// Our hook DLL
 const HOOK_DLL: &str = "gatejumper.dll";
 
@@ -141,7 +139,36 @@ fn main() {
         let game_exe_path = if args.len() > 1 {
             args[1].clone()
         } else {
-            format!("{}\\{}", our_dir, REAL_GAME_EXE)
+            let mut found_exe = None;
+            if let Ok(entries) = std::fs::read_dir(&our_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        if let Some(ext) = path.extension() {
+                            if ext.to_ascii_lowercase() == "exe" {
+                                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                                    if let Some(file_stem) = path.file_stem().and_then(|s| s.to_str()) {
+                                        let lname = name.to_ascii_lowercase();
+                                        if lname != "injector.exe" && lname != "unitycrashhandler64.exe" && lname != "unitycrashhandler32.exe" {
+                                            let data_dir = format!("{}\\{}_Data", our_dir, file_stem);
+                                            if std::path::Path::new(&data_dir).is_dir() {
+                                                found_exe = Some(format!("{}\\{}", our_dir, name));
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(exe) = found_exe {
+                exe
+            } else {
+                debug_log("[GateJumper Injector] FATAL: Could not auto-detect target .exe in the current directory.");
+                return;
+            }
         };
         let hook_dll_path = format!("{}\\{}", our_dir, HOOK_DLL);
 

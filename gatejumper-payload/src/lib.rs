@@ -1,140 +1,110 @@
 //! GateJumper Payload
 //!
-//! Exposes a DllMain that strips memory locks directly from the
-//! entry point of the protected game executable and forcefully hijacks
-//! the thread to start the unmodified Unity Engine automatically, 
-//! circumventing the CrackProof routine entirely.
+//! Forcefully hijacks the entry point of the target executable to launch 
+//! UnityPlayer.dll directly, circumventing the anti-cheat packer entirely.
+
 #![windows_subsystem = "windows"]
-#![allow(non_snake_case, unused_variables)]
+#![allow(non_snake_case, non_upper_case_globals)]
 
-use std::ffi::{c_void, CString, OsStr};
-use std::os::windows::ffi::OsStrExt;
-use std::ptr;
-use std::mem;
+use std::ffi::c_void;
 
-type HANDLE = isize;
-type HINSTANCE = HANDLE;
-type DWORD = u32;
 type BOOL = i32;
-type LPVOID = *mut c_void;
-type LPCSTR = *const u8;
-type LPCWSTR = *const u16;
-
-const DLL_PROCESS_ATTACH: DWORD = 1;
+type HINSTANCE = isize;
+type DWORD = u32;
 
 extern "system" {
-    fn DisableThreadLibraryCalls(hLibModule: HINSTANCE) -> BOOL;
-    fn GetModuleHandleA(lpModuleName: LPCSTR) -> HINSTANCE;
-    fn GetProcAddress(hModule: HINSTANCE, lpProcName: LPCSTR) -> *mut c_void;
-    fn GetCommandLineA() -> LPCSTR;
-    fn GetCommandLineW() -> LPCWSTR;
-    fn LoadLibraryW(lpLibFileName: LPCWSTR) -> HINSTANCE;
-    fn VirtualProtect(lpAddress: LPVOID, dwSize: usize, flNewProtect: DWORD, lpflOldProtect: *mut DWORD) -> BOOL;
-    fn OutputDebugStringA(lpOutputString: LPCSTR);
+    fn GetModuleHandleA(lpModuleName: *const u8) -> HINSTANCE;
+    fn GetProcAddress(hModule: HINSTANCE, lpProcName: *const u8) -> Option<unsafe extern "system" fn()>;
+    fn LoadLibraryW(lpLibFileName: *const u16) -> HINSTANCE;
+    fn VirtualProtect(lpAddress: *mut c_void, dwSize: usize, flNewProtect: u32, lpflOldProtect: *mut u32) -> BOOL;
+    fn GetCommandLineW() -> *const u16;
+    fn OutputDebugStringA(lpOutputString: *const u8);
 }
 
-const PAGE_EXECUTE_READWRITE: DWORD = 0x40;
+const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+const DLL_PROCESS_ATTACH: u32 = 1;
 
-unsafe fn debug_log(msg: &str) {
-    let mut buf = msg.as_bytes().to_vec();
-    buf.push(0);
+unsafe fn log(msg: &str) {
+    let mut buf = String::from(msg);
+    buf.push('\0');
     OutputDebugStringA(buf.as_ptr());
 }
 
 fn get_game_entry_point() -> *mut u8 {
     unsafe {
-        let base = GetModuleHandleA(ptr::null());
-        if base == 0 {
-            return ptr::null_mut();
-        }
+        let base = GetModuleHandleA(std::ptr::null());
+        if base == 0 { return std::ptr::null_mut(); }
 
         let dos_header = base as *const u8;
-        // e_lfanew is at offset 0x3C
         let e_lfanew = *(dos_header.add(0x3C) as *const u32);
-        
         let nt_headers = dos_header.add(e_lfanew as usize);
-        // AddressOfEntryPoint is at offset 0x28 in OptionalHeader for PE32+ (64-bit)
-        // Signature (4) + FileHeader (20) + Offset to AddressOfEntryPoint (16) = 40
-        let addr_of_ep = *(nt_headers.add(40) as *const u32);
+        let addr_of_ep = *(nt_headers.add(40) as *const u32); // PE32+ AddressOfEntryPoint
         
         dos_header.add(addr_of_ep as usize) as *mut u8
     }
 }
 
-pub extern "system" fn run_unity_main() -> i32 {
+pub extern "system" fn launch_unity() -> i32 {
     unsafe {
-        debug_log("[GateJumper] Hooked Entry Point triggered! Starting Unity...");
+        log("[GateJumper] OEP Hijack triggered. Initialising Unity Engine...");
 
-        let unity_path: Vec<u16> = OsStr::new("UnityPlayer.dll").encode_wide().chain(std::iter::once(0)).collect();
+        let unity_path: Vec<u16> = "UnityPlayer.dll\0".encode_utf16().collect();
         let h_unity = LoadLibraryW(unity_path.as_ptr());
         if h_unity == 0 {
-            debug_log("[GateJumper] FATAL: Could not load UnityPlayer.dll");
+            log("[GateJumper] FATAL: UnityPlayer.dll not found.");
             return 1;
         }
 
-        debug_log("[GateJumper] UnityPlayer.dll loaded.");
-
-        let main_name = CString::new("UnityMain").unwrap();
-        let unity_main_ptr = GetProcAddress(h_unity, main_name.as_ptr() as LPCSTR);
-        if unity_main_ptr.is_null() {
-            debug_log("[GateJumper] FATAL: Could not find UnityMain");
-            return 1;
+        let unity_main_ptr = GetProcAddress(h_unity, b"UnityMain\0".as_ptr());
+        if let Some(unity_main_fn) = unity_main_ptr {
+            let unity_main: extern "system" fn(HINSTANCE, *mut c_void, *const u16, i32) -> i32 = 
+                std::mem::transmute(unity_main_fn);
+            
+            log("[GateJumper] Handing over execution to UnityMain...");
+            return unity_main(GetModuleHandleA(std::ptr::null()), std::ptr::null_mut(), GetCommandLineW(), 10);
         }
 
-        debug_log("[GateJumper] Found UnityMain. Passing execution to game engine...");
-
-        let unity_main: extern "system" fn(HINSTANCE, *mut c_void, LPCWSTR, i32) -> i32 = mem::transmute(unity_main_ptr);
-        
-        let h_instance = GetModuleHandleA(ptr::null());
-        let cmd_line = GetCommandLineW();
-        
-        unity_main(h_instance, ptr::null_mut(), cmd_line, 10)
+        log("[GateJumper] FATAL: UnityMain export not found.");
+        1
     }
 }
 
 #[no_mangle]
 pub extern "system" fn DllMain(
-    dll_module: HINSTANCE,
-    call_reason: DWORD,
-    _reserved: LPVOID,
+    _module: HINSTANCE,
+    reason: u32,
+    _reserved: *mut c_void,
 ) -> BOOL {
-    if call_reason == DLL_PROCESS_ATTACH {
+    if reason == DLL_PROCESS_ATTACH {
         unsafe {
-            DisableThreadLibraryCalls(dll_module);
-            debug_log("[GateJumper] DLL injected successfully. Preparing bypass...");
-
+            log("[GateJumper] Injected. Preparing OEP Hijack...");
+            
             let ep = get_game_entry_point();
             if ep.is_null() {
-                debug_log("[GateJumper] FATAL: Could not get executable entry point.");
-                return 0; // abort loading
+                log("[GateJumper] FATAL: Entry point not found.");
+                return 0;
             }
 
-            debug_log(&format!("[GateJumper] Game Entry Point found at {:?}", ep));
-
             let mut old_protect = 0;
-            if VirtualProtect(ep as LPVOID, 14, PAGE_EXECUTE_READWRITE, &mut old_protect) != 0 {
-                // Write absolute jump to run_unity_main
-                // jmp [rip+0]
-                // address (8 bytes)
-                let target = run_unity_main as usize;
+            if VirtualProtect(ep as _, 14, PAGE_EXECUTE_READWRITE, &mut old_protect) != 0 {
+                let target = launch_unity as usize;
                 
-                *ep.add(0) = 0xFF; // JMP
-                *ep.add(1) = 0x25; // MODRM (RIP-relative)
-                *ep.add(2) = 0x00; // Offset 0
+                // 64-bit absolute jump:
+                // jmp [rip+0] / ff 25 00 00 00 00
+                // 00 00 00 00 00 00 00 00 (target address)
+                *ep.add(0) = 0xFF;
+                *ep.add(1) = 0x25;
+                *ep.add(2) = 0x00;
                 *ep.add(3) = 0x00;
                 *ep.add(4) = 0x00;
                 *ep.add(5) = 0x00;
                 
-                let target_bytes: [u8; 8] = mem::transmute(target);
-                ep.add(6).copy_from_nonoverlapping(target_bytes.as_ptr(), 8);
+                let target_bytes: [u8; 8] = std::mem::transmute(target);
+                std::ptr::copy_nonoverlapping(target_bytes.as_ptr(), ep.add(6), 8);
 
-                VirtualProtect(ep as LPVOID, 14, old_protect, &mut old_protect);
-                debug_log("[GateJumper] Successfully patched Entry Point with JMP out of CrackProof!");
-            } else {
-                debug_log("[GateJumper] FATAL: VirtualProtect on Entry Point failed.");
-                return 0;
+                log(&format!("[GateJumper] OEP patched at {:?}. Bypass ready.", ep));
             }
         }
     }
-    1 // TRUE
+    1
 }

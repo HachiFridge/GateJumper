@@ -26,6 +26,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "injector"
+version = "0.1.2"
+
+[[package]]
 name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"

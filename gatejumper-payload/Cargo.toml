@@ -1,11 +1,11 @@
 [package]
 name = "gatejumper-payload"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
-description = "GateJumper Payload"
 
 [lib]
 crate-type = ["cdylib"]
 name = "gatejumper"
 
 [dependencies]
+minhook = "0.6"

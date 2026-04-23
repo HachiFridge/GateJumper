@@ -65,8 +65,6 @@ extern "system" {
 
 use std::ffi::c_void;
 
-const HOOK_DLL: &str = "gatejumper.dll";
-
 unsafe fn log(msg: &str) {
     let mut buf = String::from(msg);
     buf.push('\0');
@@ -155,7 +153,14 @@ fn main() {
             "."
         };
 
-        let dll_path = format!("{}\\{}\0", our_dir, HOOK_DLL);
+        let exe_name_lower = exe_path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+        let hook_dll = if exe_name_lower.contains("dmmgameplayer") {
+            "dmmhook.dll"
+        } else {
+            "gatejumper.dll"
+        };
+
+        let dll_path = format!("{}\\{}\0", our_dir, hook_dll);
         let dll_bytes = dll_path.as_bytes();
         let alloc_addr = VirtualAllocEx(
             process_info.hProcess,

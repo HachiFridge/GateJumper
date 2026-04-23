@@ -48,15 +48,15 @@ Many heavily packed Steam games explicitly mitigate local DLL proxying, preventi
 5. Launch the game normally via Steam. The injector will intercept the launch, spawn the game safely suspended, inject the payload, and hand over execution.
 
 ### 2. DMM Game Player Games (Windows & Linux)
-The DMM Launcher strictly verifies the game directory and will forcefully delete unrecognized proxy DLLs. To bypass this, we use a two-part hook system that operates identically across Windows and Wine.
+The DMM Launcher actively nukes unknown files in its own installation directory during updates. To completely avoid this, we use our universal `injector.exe` as a shortcut wrapper, allowing all bypass files to live safely in your game folder.
 
-1. **The Launcher Hook:** Copy `hook.dll` from your build output and place it into the **DMM Game Player installation folder** (e.g., `C:\Program Files\DMMGamePlayer`), renaming it to **`version.dll`**.
-   - **Linux/Wine Users:** You must explicitly configure a Wine DLL override for `version` (Native, Builtin) within your runner (e.g., Bottles, Lutris, or via `WINEDLLOVERRIDES="version=n,b"`) for the DMM prefix.
-   - *This quietly intercepts DMM's launch sequence, preserves the required authentication tokens, and stealth-injects our payload.*
-2. **The Payload:** Copy `gatejumper.dll` from your build output and place it into the **game's root folder** (e.g., `D:\Games\YourUnityGame`).
-   - *Since it is not named `version.dll`, DMM's integrity check completely ignores it.*
-3. *(Optional)* Create a `plugins` folder in the game's root directory and place your mods inside.
-4. Launch the game normally via the DMM Game Player.
+1. Copy **all three files** (`injector.exe`, `dmmhook.dll`, and `gatejumper.dll`) from your build output directly into the **game's root folder**.
+   - *Because they are not named `version.dll`, DMM's integrity check ignores them entirely.*
+2. *(Optional)* Create a `plugins` folder in the game's root directory and place your `.dll` mods inside.
+3. Create a shortcut (or modify your existing DMM desktop shortcut) to launch the injector and point it at DMM:
+   - **Target:** `"C:\Path\To\Your\Game\injector.exe" "C:\Program Files\DMMGamePlayer\DMMGamePlayer.exe"`
+4. Launch DMM using the new/modified shortcut. The injector will automatically detect DMM, spawn it suspended, and inject `dmmhook.dll`.
+5. When you click "Play" in DMM, the hook intercepts the launch sequence, extracts your authentication tokens, and stealth-injects `gatejumper.dll` into the game.
 
 ### 3. Standalone / Normal Run (Windows & Linux)
 If you are launching the game completely standalone, without any DRM clients or wrappers:
@@ -69,6 +69,6 @@ If you are launching the game completely standalone, without any DRM clients or 
 
 1. **Interception:**
    - On **Steam/Standalone**, `injector.exe` uses the `CREATE_SUSPENDED` flag to spawn the game process, subsequently queuing an Asynchronous Procedure Call (APC) to force the process to load `gatejumper.dll`.
-   - On **DMM**, `hook.dll` intercepts `ShellExecuteW` directly within the launcher, extracts the secure launch tokens, and performs a similar suspended launch and memory injection.
+   - On **DMM**, `dmmhook.dll` (injected via `injector.exe`) intercepts `CreateProcessW` directly within the launcher, extracts the secure launch tokens, and performs a similar suspended launch and memory injection.
 2. **OEP Hijack:** Once injected, GateJumper locates the game's original AddressOfEntryPoint (OEP). Because the anti-cheat has already modified the PE headers to point to its own unpacking stub, GateJumper overwrites the first 14 bytes of the stub with an absolute jump instruction pointing to its own custom engine launcher.
 3. **Execution & Handover:** Once the OS resumes the process, execution immediately jumps to GateJumper. It loads any DLLs found in the `plugins` directory, dynamically locates `UnityPlayer.dll`, formats the `GetCommandLineW()` arguments (ensuring DMM tokens align perfectly), and invokes `UnityMain`. The game boots flawlessly while the anti-cheat remains completely inactive in memory.

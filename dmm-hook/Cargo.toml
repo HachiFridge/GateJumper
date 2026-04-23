@@ -5,7 +5,7 @@ edition = "2021"
 
 [lib]
 crate-type = ["cdylib"]
-name = "hook"
+name = "dmmhook"
 
 [dependencies]
 minhook = "0.9"

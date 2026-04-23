@@ -1,9 +1,9 @@
 //! GateJumper Injector
 //!
-//! Launches the target process suspended and injects the GateJumper payload 
-//! via APC, ensuring the hijack occurs before the anti-cheat executes.
+//! Spawns process suspended and injects payload via APC.
 
 #![windows_subsystem = "windows"]
+#![allow(non_snake_case)]
 
 use std::ptr;
 
@@ -81,21 +81,36 @@ fn main() {
         startup_info.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
         let mut process_info: PROCESS_INFORMATION = std::mem::zeroed();
 
-        // Dynamically find the game executable
         let mut target_exe = None;
-        if let Ok(entries) = std::fs::read_dir(".") {
-            for entry in entries.filter_map(|e| e.ok()) {
-                let path = entry.path();
-                if let Some(ext) = path.extension() {
-                    if ext.to_ascii_lowercase() == "exe" {
-                        let name = path.file_name().unwrap().to_string_lossy().to_lowercase();
-                        // Ignore ourselves and common utilities
-                        if name != "injector.exe" && 
-                           name != "unitycrashhandler64.exe" && 
-                           name != "start.exe" &&
-                           !name.contains("uninstall") {
-                            target_exe = Some(path);
-                            break;
+        let mut cmd_line_w: Vec<u16> = Vec::new();
+        let mut using_args = false;
+
+        let args: Vec<String> = std::env::args().collect();
+        if args.len() > 1 {
+            let path = std::path::PathBuf::from(&args[1]);
+            if path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase() == "exe" {
+                target_exe = Some(path);
+                using_args = true;
+                
+                let cmd_str = args[1..].join(" ");
+                cmd_line_w = cmd_str.encode_utf16().chain(std::iter::once(0)).collect();
+            }
+        }
+
+        if target_exe.is_none() {
+            if let Ok(entries) = std::fs::read_dir(".") {
+                for entry in entries.filter_map(|e| e.ok()) {
+                    let path = entry.path();
+                    if let Some(ext) = path.extension() {
+                        if ext.to_ascii_lowercase() == "exe" {
+                            let name = path.file_name().unwrap().to_string_lossy().to_lowercase();
+                            if name != "injector.exe" && 
+                               name != "unitycrashhandler64.exe" && 
+                               name != "start.exe" &&
+                               !name.contains("uninstall") {
+                                target_exe = Some(path);
+                                break;
+                            }
                         }
                     }
                 }
@@ -111,10 +126,11 @@ fn main() {
         };
 
         let exe_name_w: Vec<u16> = exe_path.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+        let lp_command_line = if using_args { cmd_line_w.as_mut_ptr() } else { ptr::null_mut() };
         
         let success = CreateProcessW(
             exe_name_w.as_ptr(),
-            ptr::null_mut(),
+            lp_command_line,
             ptr::null(),
             ptr::null(),
             0,
@@ -130,7 +146,6 @@ fn main() {
             return;
         }
 
-        // Use absolute path for the DLL
         let mut path_buf = [0u16; 512];
         let len = GetModuleFileNameW(0, path_buf.as_mut_ptr(), 512);
         let our_path = String::from_utf16_lossy(&path_buf[..len as usize]);

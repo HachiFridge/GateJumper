@@ -1,6 +1,6 @@
 [package]
 name = "gatejumper-payload"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 
 [lib]
@@ -8,4 +8,5 @@ crate-type = ["cdylib"]
 name = "gatejumper"
 
 [dependencies]
-minhook = "0.6"
+minhook = "0.9"
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }

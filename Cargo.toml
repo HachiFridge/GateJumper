@@ -1,7 +1,8 @@
 [workspace]
 members = [
+    "dmm-hook",
     "gatejumper-payload",
-    "injector",
+    "injector"
 ]
 resolver = "2"
 

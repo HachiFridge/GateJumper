@@ -133,7 +133,6 @@ pub extern "system" fn launch_unity() -> i32 {
             let unity_main: extern "system" fn(HINSTANCE, *mut c_void, *const u16, i32) -> i32 =
                 std::mem::transmute(unity_main_fn);
 
-            log("Handing execution to UnityMain.");
             let mut cmd_ptr = GetCommandLineW();
             if !cmd_ptr.is_null() {
                 let mut in_quotes = false;
@@ -150,15 +149,22 @@ pub extern "system" fn launch_unity() -> i32 {
                     }
                     i += 1;
                 }
-                
-                let len = (0..).take_while(|&idx| *cmd_ptr.add(idx) != 0).count();
-                let slice = std::slice::from_raw_parts(cmd_ptr, len);
-                let cmd_str = String::from_utf16_lossy(slice);
-                log(&format!("Passing lpCmdLine: {}", cmd_str));
-            } else {
-                log("WARNING: GetCommandLineW returned null!");
             }
-            return unity_main(GetModuleHandleA(std::ptr::null()), std::ptr::null_mut(), cmd_ptr, 10);
+            
+            log("Handing execution to UnityMain.");
+            
+            std::arch::asm!(
+                "and rsp, -16", // 16-byte alignment
+                "sub rsp, 32",  // Shadow space
+                "call rax",     // Call UnityMain
+                "add rsp, 32",  // Clean up
+                in("rax") unity_main,
+                in("rcx") GetModuleHandleA(std::ptr::null()),
+                in("rdx") 0,
+                in("r8") cmd_ptr,
+                in("r9") 1,
+            );
+            return 0;
         }
 
         log("FATAL: UnityMain export not found.");

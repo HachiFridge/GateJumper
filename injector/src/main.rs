@@ -66,14 +66,16 @@ extern "system" {
 use std::ffi::c_void;
 
 unsafe fn log(msg: &str) {
-    let mut buf = String::from(msg);
-    buf.push('\0');
-    OutputDebugStringA(buf.as_ptr());
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("injector.log") {
+        let _ = writeln!(file, "[Injector] {}", msg);
+    }
 }
 
 fn main() {
     unsafe {
-        log("[GateJumper] Starting injector...");
+        let args: Vec<String> = std::env::args().collect();
+        log(&format!("Starting with args: {:?}", args));
 
         let mut startup_info: STARTUPINFOW = std::mem::zeroed();
         startup_info.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
@@ -83,29 +85,55 @@ fn main() {
         let mut cmd_line_w: Vec<u16> = Vec::new();
         let mut using_args = false;
 
-        let args: Vec<String> = std::env::args().collect();
+        let our_name = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_lowercase()))
+            .unwrap_or_else(|| "injector.exe".to_string());
+
         if args.len() > 1 {
-            let path = std::path::PathBuf::from(&args[1]);
-            if path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase() == "exe" {
-                target_exe = Some(path);
-                using_args = true;
+            for (i, arg) in args.iter().enumerate().skip(1) {
+                let trimmed = arg.trim_matches('"');
+                log(&format!("Checking arg[{}]: {}", i, trimmed));
+                let path = std::path::PathBuf::from(trimmed);
                 
-                let cmd_str = args[1..].join(" ");
-                cmd_line_w = cmd_str.encode_utf16().chain(std::iter::once(0)).collect();
+                if path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase() == "exe" {
+                    let name = path.file_name().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+                    if name != our_name && name != "start.exe" {
+                        log(&format!("Found target exe in args: {:?}", path));
+                        target_exe = Some(path);
+                        using_args = true;
+                        
+                        let cmd_parts: Vec<String> = args[i..].iter().map(|s| {
+                            if s.contains(' ') && !s.starts_with('"') {
+                                format!("\"{}\"", s)
+                            } else {
+                                s.clone()
+                            }
+                        }).collect();
+                        let cmd_str = cmd_parts.join(" ");
+                        log(&format!("Reconstructed cmd line: {}", cmd_str));
+                        cmd_line_w = cmd_str.encode_utf16().chain(std::iter::once(0)).collect();
+                        break;
+                    } else {
+                        log("Arg is the injector itself, skipping.");
+                    }
+                }
             }
         }
 
         if target_exe.is_none() {
+            log("No target EXE in args, scanning current directory...");
             if let Ok(entries) = std::fs::read_dir(".") {
                 for entry in entries.filter_map(|e| e.ok()) {
                     let path = entry.path();
                     if let Some(ext) = path.extension() {
                         if ext.to_ascii_lowercase() == "exe" {
                             let name = path.file_name().unwrap().to_string_lossy().to_lowercase();
-                            if name != "injector.exe" && 
+                            if name != our_name && 
                                name != "unitycrashhandler64.exe" && 
                                name != "start.exe" &&
                                !name.contains("uninstall") {
+                                log(&format!("Found local target: {:?}", path));
                                 target_exe = Some(path);
                                 break;
                             }
@@ -116,9 +144,12 @@ fn main() {
         }
 
         let exe_path = match target_exe {
-            Some(p) => p,
+            Some(p) => {
+                log(&format!("Selected EXE: {:?}", p));
+                p
+            },
             None => {
-                log("[GateJumper] FATAL: Could not find a suitable game executable.");
+                log("FATAL: Could not find a suitable game executable.");
                 return;
             }
         };

@@ -176,7 +176,7 @@ pub extern "system" fn DllMain(
 ) -> BOOL {
     if reason == DLL_PROCESS_ATTACH {
         unsafe {
-            log("=== GateJumper version.dll proxy loaded ===");
+            log("=== GateJumper Payload loaded ===");
 
             setup_hooks();
 

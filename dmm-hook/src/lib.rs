@@ -24,7 +24,7 @@ use windows::{
 const DLL_PROCESS_ATTACH: u32 = 1;
 
 unsafe fn log(msg: &str) {
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open("dmm-hook.log") {
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open("gatejumper.log") {
         let _ = writeln!(file, "[DMM-Hook] {}", msg);
     }
 }

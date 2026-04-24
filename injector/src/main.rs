@@ -67,7 +67,8 @@ use std::ffi::c_void;
 
 unsafe fn log(msg: &str) {
     use std::io::Write;
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("injector.log") {
+    println!("[Injector] {}", msg);
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("gatejumper.log") {
         let _ = writeln!(file, "[Injector] {}", msg);
     }
 }

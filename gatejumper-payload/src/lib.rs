@@ -24,7 +24,6 @@ use windows::{
     Win32::Foundation::{SetLastError, ERROR_FILE_NOT_FOUND},
 };
 
-mod proxy;
 
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 const DLL_PROCESS_ATTACH: u32 = 1;
@@ -178,9 +177,6 @@ pub extern "system" fn DllMain(
     if reason == DLL_PROCESS_ATTACH {
         unsafe {
             log("=== GateJumper version.dll proxy loaded ===");
-
-            proxy::version::init();
-            log("version.dll proxy initialized.");
 
             setup_hooks();
 

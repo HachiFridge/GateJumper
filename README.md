@@ -10,7 +10,7 @@ GateJumper circumvents heavily obfuscated anti-cheat packers (like CrackProof) w
 - **Cross-Platform & Multi-Launcher:** Full support for Native Windows and Linux (Wine/Proton). Integrates seamlessly into Steam direct-launches, DRM launchers (like DMM Game Player), and standalone unmanaged runs.
 - **Built-in Mod Loader:** Automatically scans a `plugins` directory and dynamically loads any `.dll` mods at runtime. This circumvents aggressive launcher integrity sweeps that delete standard proxy DLLs.
 - **Passive Stealth:** By intercepting execution *before* the anti-cheat unpacks the game, GateJumper boots straight into the Unity engine, leaving the anti-cheat completely dormant in memory.
-- **Native OS Integration:** Operates purely in user-mode with zero kernel drivers required. Proxies load natively via standard OS search order rules, eliminating the need for obsolete `.local` folder redirections.
+- **Native OS Integration:** Operates purely in user-mode with zero kernel drivers required. Uses a universal injection method that eliminates the need for DLL proxying or `.local` folder redirections.
 
 ## Building
 

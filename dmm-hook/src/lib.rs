@@ -20,7 +20,6 @@ use windows::{
     },
 };
 
-mod proxy;
 
 const DLL_PROCESS_ATTACH: u32 = 1;
 
@@ -465,7 +464,6 @@ pub extern "system" fn DllMain(
     if reason == DLL_PROCESS_ATTACH {
         unsafe {
             log("=== DMM-Hook loaded into DMM Game Player ===");
-            proxy::version::init();
             setup_hooks();
         }
     }

@@ -36,6 +36,10 @@ unsafe fn log(msg: &str) {
     }
 }
 
+unsafe fn truncate_log() {
+    let _ = OpenOptions::new().create(true).write(true).truncate(true).open("gatejumper.log");
+}
+
 // --- PathFileExistsW Hook ---
 
 static mut PATH_FILE_EXISTS_W_ORIG: usize = 0;
@@ -182,6 +186,7 @@ pub extern "system" fn DllMain(
 ) -> BOOL {
     if reason == DLL_PROCESS_ATTACH {
         unsafe {
+            truncate_log();
             log("=== GateJumper Payload loaded ===");
 
             setup_hooks();

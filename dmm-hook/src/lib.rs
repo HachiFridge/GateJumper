@@ -29,6 +29,10 @@ unsafe fn log(msg: &str) {
     }
 }
 
+unsafe fn truncate_log() {
+    let _ = OpenOptions::new().create(true).write(true).truncate(true).open("gatejumper.log");
+}
+
 // --- Ntdll FFI ---
 #[repr(C)]
 struct PROCESS_BASIC_INFORMATION {
@@ -463,6 +467,7 @@ pub extern "system" fn DllMain(
 ) -> BOOL {
     if reason == DLL_PROCESS_ATTACH {
         unsafe {
+            truncate_log();
             log("=== DMM-Hook loaded into DMM Game Player ===");
             setup_hooks();
         }

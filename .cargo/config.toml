@@ -1,6 +1,12 @@
+# Force MSVC target — this project only builds for Windows
+[build]
+target = "x86_64-pc-windows-msvc"
+
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
 
 [alias]
-winbuild = "xwin build --target x86_64-pc-windows-msvc"
-winbuild-rel = "xwin build --target x86_64-pc-windows-msvc --release"
+xbuild-dev = "xwin build --target x86_64-pc-windows-msvc --dev"
+xbuild = "xwin build --target x86_64-pc-windows-msvc --release"
+xcheck-dev = "xwin check --target x86_64-pc-windows-msvc --dev"
+xcheck = "xwin check --target x86_64-pc-windows-msvc --release"

@@ -5,71 +5,30 @@
 #![windows_subsystem = "windows"]
 #![allow(non_snake_case)]
 
-use std::ptr;
-
-type BOOL = i32;
-type HANDLE = isize;
-type LPWSTR = *mut u16;
-type LPCWSTR = *const u16;
-type LPVOID = *mut std::ffi::c_void;
-type LPCVOID = *const std::ffi::c_void;
-type DWORD = u32;
-
-#[repr(C)]
-pub struct STARTUPINFOW {
-    pub cb: u32,
-    pub lpReserved: LPWSTR,
-    pub lpDesktop: LPWSTR,
-    pub lpTitle: LPWSTR,
-    pub dwX: u32,
-    pub dwY: u32,
-    pub dwXSize: u32,
-    pub dwYSize: u32,
-    pub dwXCountChars: u32,
-    pub dwYCountChars: u32,
-    pub dwFillAttribute: u32,
-    pub dwFlags: u32,
-    pub wShowWindow: u16,
-    pub cbReserved2: u16,
-    pub lpReserved2: *mut u8,
-    pub hStdInput: HANDLE,
-    pub hStdOutput: HANDLE,
-    pub hStdError: HANDLE,
-}
-
-#[repr(C)]
-pub struct PROCESS_INFORMATION {
-    pub hProcess: HANDLE,
-    pub hThread: HANDLE,
-    pub dwProcessId: u32,
-    pub dwThreadId: u32,
-}
-
-const CREATE_SUSPENDED: u32 = 0x00000004;
-const MEM_COMMIT: u32 = 0x00001000;
-const MEM_RESERVE: u32 = 0x00002000;
-const PAGE_READWRITE: u32 = 0x04;
-
-extern "system" {
-    fn CreateProcessW(lpApplicationName: LPCWSTR, lpCommandLine: LPWSTR, lpProcessAttributes: *const c_void, lpThreadAttributes: *const c_void, bInheritHandles: BOOL, dwCreationFlags: DWORD, lpEnvironment: *const c_void, lpCurrentDirectory: LPCWSTR, lpStartupInfo: *const STARTUPINFOW, lpProcessInformation: *mut PROCESS_INFORMATION) -> BOOL;
-    fn VirtualAllocEx(hProcess: HANDLE, lpAddress: LPVOID, dwSize: usize, flAllocationType: DWORD, flProtect: DWORD) -> LPVOID;
-    fn WriteProcessMemory(hProcess: HANDLE, lpBaseAddress: LPVOID, lpBuffer: LPCVOID, nSize: usize, lpNumberOfBytesWritten: *mut usize) -> BOOL;
-    fn GetModuleHandleA(lpModuleName: *const u8) -> HANDLE;
-    fn GetProcAddress(hModule: HANDLE, lpProcName: *const u8) -> Option<unsafe extern "system" fn()>;
-    fn QueueUserAPC(pfnAPC: usize, hThread: HANDLE, dwData: usize) -> u32;
-    fn ResumeThread(hThread: HANDLE) -> u32;
-    fn CloseHandle(hObject: HANDLE) -> BOOL;
-    fn GetModuleFileNameW(hModule: HANDLE, lpFilename: *mut u16, nSize: u32) -> u32;
-    fn OutputDebugStringA(lpOutputString: *const u8);
-}
-
-use std::ffi::c_void;
+use windows::core::{PCSTR, PCWSTR, PWSTR};
+use windows::Win32::Foundation::{CloseHandle, GetLastError};
+use windows::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleA, GetProcAddress};
+use windows::Win32::System::Memory::{VirtualAllocEx, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
+use windows::Win32::System::Threading::{
+    CreateProcessW, QueueUserAPC, ResumeThread, TerminateProcess, CREATE_SUSPENDED,
+    PROCESS_INFORMATION, STARTUPINFOW,
+};
 
 unsafe fn log(msg: &str) {
     use std::io::Write;
     println!("[Injector] {}", msg);
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("gatejumper.log") {
-        let _ = writeln!(file, "[Injector] {}", msg);
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(parent) = exe_path.parent() {
+            let log_path = parent.join("gatejumper.log");
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_path)
+            {
+                let _ = writeln!(file, "[Injector] {}", msg);
+            }
+        }
     }
 }
 
@@ -96,21 +55,33 @@ fn main() {
                 let trimmed = arg.trim_matches('"');
                 log(&format!("Checking arg[{}]: {}", i, trimmed));
                 let path = std::path::PathBuf::from(trimmed);
-                
-                if path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase() == "exe" {
-                    let name = path.file_name().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+
+                if path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_lowercase()
+                    == "exe"
+                {
+                    let name = path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_lowercase())
+                        .unwrap_or_default();
                     if name != our_name && name != "start.exe" {
                         log(&format!("Found target exe in args: {:?}", path));
                         target_exe = Some(path);
                         using_args = true;
-                        
-                        let cmd_parts: Vec<String> = args[i..].iter().map(|s| {
-                            if s.contains(' ') && !s.starts_with('"') {
-                                format!("\"{}\"", s)
-                            } else {
-                                s.clone()
-                            }
-                        }).collect();
+
+                        let cmd_parts: Vec<String> = args[i..]
+                            .iter()
+                            .map(|s| {
+                                if s.contains(' ') && !s.starts_with('"') {
+                                    format!("\"{}\"", s)
+                                } else {
+                                    s.clone()
+                                }
+                            })
+                            .collect();
                         let cmd_str = cmd_parts.join(" ");
                         log(&format!("Reconstructed cmd line: {}", cmd_str));
                         cmd_line_w = cmd_str.encode_utf16().chain(std::iter::once(0)).collect();
@@ -129,11 +100,16 @@ fn main() {
                     let path = entry.path();
                     if let Some(ext) = path.extension() {
                         if ext.to_ascii_lowercase() == "exe" {
-                            let name = path.file_name().unwrap().to_string_lossy().to_lowercase();
-                            if name != our_name && 
-                               name != "unitycrashhandler64.exe" && 
-                               name != "start.exe" &&
-                               !name.contains("uninstall") {
+                            let name = path
+                                .file_name()
+                                .unwrap()
+                                .to_string_lossy()
+                                .to_lowercase();
+                            if name != our_name
+                                && name != "unitycrashhandler64.exe"
+                                && name != "start.exe"
+                                && !name.contains("uninstall")
+                            {
                                 log(&format!("Found local target: {:?}", path));
                                 target_exe = Some(path);
                                 break;
@@ -148,36 +124,47 @@ fn main() {
             Some(p) => {
                 log(&format!("Selected EXE: {:?}", p));
                 p
-            },
+            }
             None => {
                 log("FATAL: Could not find a suitable game executable.");
                 return;
             }
         };
 
-        let exe_name_w: Vec<u16> = exe_path.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
-        let lp_command_line = if using_args { cmd_line_w.as_mut_ptr() } else { ptr::null_mut() };
-        
+        let exe_name_w: Vec<u16> = exe_path
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let lp_command_line = if using_args {
+            Some(PWSTR(cmd_line_w.as_mut_ptr()))
+        } else {
+            None
+        };
+
         let success = CreateProcessW(
-            exe_name_w.as_ptr(),
+            PCWSTR(exe_name_w.as_ptr()),
             lp_command_line,
-            ptr::null(),
-            ptr::null(),
-            0,
+            None,
+            None,
+            false,
             CREATE_SUSPENDED,
-            ptr::null(),
-            ptr::null(),
+            None,
+            None,
             &startup_info,
             &mut process_info,
         );
 
-        if success == 0 {
-            log("[GateJumper] CreateProcessW failed!");
+        if success.is_err() {
+            log(&format!(
+                "[GateJumper] CreateProcessW failed! Error: {:?}",
+                GetLastError()
+            ));
             return;
         }
 
         let mut path_buf = [0u16; 512];
-        let len = GetModuleFileNameW(0, path_buf.as_mut_ptr(), 512);
+        let len = GetModuleFileNameW(None, &mut path_buf);
         let our_path = String::from_utf16_lossy(&path_buf[..len as usize]);
         let our_dir = if let Some(pos) = our_path.rfind('\\') {
             &our_path[..pos]
@@ -185,7 +172,11 @@ fn main() {
             "."
         };
 
-        let exe_name_lower = exe_path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+        let exe_name_lower = exe_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase();
         let hook_dll = if exe_name_lower.contains("dmmgameplayer") {
             "dmmhook.dll"
         } else {
@@ -196,34 +187,56 @@ fn main() {
         let dll_bytes = dll_path.as_bytes();
         let alloc_addr = VirtualAllocEx(
             process_info.hProcess,
-            ptr::null_mut(),
+            None,
             dll_bytes.len(),
             MEM_COMMIT | MEM_RESERVE,
             PAGE_READWRITE,
         );
 
+        let mut injection_successful = false;
+
         if !alloc_addr.is_null() {
-            WriteProcessMemory(
+            let mut bytes_written = 0;
+            let write_success = WriteProcessMemory(
                 process_info.hProcess,
                 alloc_addr,
                 dll_bytes.as_ptr() as _,
                 dll_bytes.len(),
-                ptr::null_mut(),
+                Some(&mut bytes_written),
             );
 
-            let k32 = GetModuleHandleA(b"kernel32.dll\0".as_ptr());
-            let load_lib = GetProcAddress(k32, b"LoadLibraryA\0".as_ptr());
+            if write_success.is_ok() && bytes_written == dll_bytes.len() {
+                let k32 = GetModuleHandleA(PCSTR(b"kernel32.dll\0".as_ptr())).unwrap();
+                let load_lib = GetProcAddress(k32, PCSTR(b"LoadLibraryA\0".as_ptr()));
 
-            if let Some(f) = load_lib {
-                QueueUserAPC(f as usize, process_info.hThread, alloc_addr as usize);
-                log("[GateJumper] APC Queued.");
+                if let Some(f) = load_lib {
+                    let apc_fn = std::mem::transmute(f);
+                    let apc_result = QueueUserAPC(apc_fn, process_info.hThread, alloc_addr as usize);
+                    if apc_result != 0 {
+                        log("[GateJumper] APC Queued.");
+                        injection_successful = true;
+                    } else {
+                        log("QueueUserAPC failed.");
+                    }
+                } else {
+                    log("GetProcAddress for LoadLibraryA failed.");
+                }
+            } else {
+                log("WriteProcessMemory failed.");
             }
+        } else {
+            log("VirtualAllocEx failed.");
         }
 
-        ResumeThread(process_info.hThread);
-        log("[GateJumper] Process resumed. Injector exiting.");
+        if injection_successful {
+            ResumeThread(process_info.hThread);
+            log("[GateJumper] Process resumed. Injector exiting.");
+        } else {
+            log("FATAL: Injection failed, terminating spawned process to prevent leaks.");
+            let _ = TerminateProcess(process_info.hProcess, 1);
+        }
 
-        CloseHandle(process_info.hProcess);
-        CloseHandle(process_info.hThread);
+        let _ = CloseHandle(process_info.hProcess);
+        let _ = CloseHandle(process_info.hThread);
     }
 }

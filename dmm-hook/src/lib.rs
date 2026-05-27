@@ -23,14 +23,26 @@ use windows::{
 
 const DLL_PROCESS_ATTACH: u32 = 1;
 
+static mut DLL_DIRECTORY: Option<std::path::PathBuf> = None;
+
 unsafe fn log(msg: &str) {
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open("gatejumper.log") {
+    let log_path = if let Some(ref dir) = DLL_DIRECTORY {
+        dir.join("gatejumper.log")
+    } else {
+        std::path::PathBuf::from("gatejumper.log")
+    };
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
         let _ = writeln!(file, "[DMM-Hook] {}", msg);
     }
 }
 
 unsafe fn truncate_log() {
-    let _ = OpenOptions::new().create(true).write(true).truncate(true).open("gatejumper.log");
+    let log_path = if let Some(ref dir) = DLL_DIRECTORY {
+        dir.join("gatejumper.log")
+    } else {
+        std::path::PathBuf::from("gatejumper.log")
+    };
+    let _ = OpenOptions::new().create(true).write(true).truncate(true).open(log_path);
 }
 
 // --- Ntdll FFI ---
@@ -467,6 +479,18 @@ pub extern "system" fn DllMain(
 ) -> BOOL {
     if reason == DLL_PROCESS_ATTACH {
         unsafe {
+            let mut path_buf = [0u16; 512];
+            let len = windows::Win32::System::LibraryLoader::GetModuleFileNameW(
+                Some(windows::Win32::Foundation::HMODULE(_module as *mut c_void)),
+                &mut path_buf,
+            );
+            if len > 0 {
+                let dll_path = String::from_utf16_lossy(&path_buf[..len as usize]);
+                if let Some(pos) = dll_path.rfind('\\') {
+                    DLL_DIRECTORY = Some(std::path::PathBuf::from(&dll_path[..pos]));
+                }
+            }
+
             truncate_log();
             log("=== DMM-Hook loaded into DMM Game Player ===");
             setup_hooks();

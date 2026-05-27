@@ -25,7 +25,7 @@ cargo build --release
 **On Linux (Cross-Compilation):**
 Requires [cargo-xwin](https://github.com/rust-cross/cargo-xwin) to be installed.
 ```bash
-cargo winbuild-rel
+cargo xbuild
 ```
 
 ## Installation Guide

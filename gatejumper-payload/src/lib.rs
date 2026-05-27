@@ -5,39 +5,53 @@
 #![windows_subsystem = "windows"]
 #![allow(non_snake_case, non_upper_case_globals)]
 
-use std::{ffi::c_void, fs::OpenOptions, io::Write};
+use std::{ffi::c_void, fs::OpenOptions, io::Write, path::PathBuf};
 
 type BOOL = i32;
 type HINSTANCE = isize;
 
-extern "system" {
-    fn GetModuleHandleA(lpModuleName: *const u8) -> HINSTANCE;
-    fn GetProcAddress(hModule: HINSTANCE, lpProcName: *const u8) -> Option<unsafe extern "system" fn()>;
-    fn LoadLibraryW(lpLibFileName: *const u16) -> HINSTANCE;
-    fn LoadLibraryA(lpLibFileName: *const u8) -> HINSTANCE;
-    fn VirtualProtect(lpAddress: *mut c_void, dwSize: usize, flNewProtect: u32, lpflOldProtect: *mut u32) -> BOOL;
-    fn GetCommandLineW() -> *const u16;
-}
-
 use windows::{
-    core::PCWSTR,
-    Win32::Foundation::{SetLastError, ERROR_FILE_NOT_FOUND},
+    core::{PCSTR, PCWSTR},
+    Win32::Foundation::{SetLastError, ERROR_FILE_NOT_FOUND, HMODULE},
+    Win32::System::LibraryLoader::{
+        GetModuleFileNameW, GetModuleHandleA, GetProcAddress, LoadLibraryA, LoadLibraryW,
+    },
+    Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE},
+    Win32::System::Environment::GetCommandLineW,
 };
 
-
-const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 const DLL_PROCESS_ATTACH: u32 = 1;
 
 // --- Logging ---
 
+static mut DLL_DIRECTORY: Option<PathBuf> = None;
+
 unsafe fn log(msg: &str) {
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open("gatejumper.log") {
+    let log_path = if let Some(ref dir) = DLL_DIRECTORY {
+        dir.join("gatejumper.log")
+    } else {
+        PathBuf::from("gatejumper.log")
+    };
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
         let _ = writeln!(file, "[GateJumper] {}", msg);
     }
 }
 
 unsafe fn truncate_log() {
-    let _ = OpenOptions::new().create(true).write(true).truncate(true).open("gatejumper.log");
+    let log_path = if let Some(ref dir) = DLL_DIRECTORY {
+        dir.join("gatejumper.log")
+    } else {
+        PathBuf::from("gatejumper.log")
+    };
+    let _ = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(log_path);
 }
 
 // --- PathFileExistsW Hook ---
@@ -63,11 +77,14 @@ unsafe extern "system" fn path_file_exists_w_hook(filename: PCWSTR) -> BOOL {
 
 fn setup_hooks() {
     unsafe {
-        let shlwapi = LoadLibraryA(b"shlwapi.dll\0".as_ptr());
-        if shlwapi != 0 {
-            let p_path_file_exists = GetProcAddress(shlwapi, b"PathFileExistsW\0".as_ptr());
+        if let Ok(shlwapi) = LoadLibraryA(PCSTR(b"shlwapi.dll\0".as_ptr())) {
+            let p_path_file_exists =
+                GetProcAddress(shlwapi, PCSTR(b"PathFileExistsW\0".as_ptr()));
             if let Some(func) = p_path_file_exists {
-                match minhook::MinHook::create_hook(func as *mut c_void, path_file_exists_w_hook as *mut c_void) {
+                match minhook::MinHook::create_hook(
+                    func as *mut c_void,
+                    path_file_exists_w_hook as *mut c_void,
+                ) {
                     Ok(trampoline) => {
                         PATH_FILE_EXISTS_W_ORIG = trampoline as usize;
                         let _ = minhook::MinHook::enable_hook(func as *mut c_void);
@@ -84,10 +101,12 @@ fn setup_hooks() {
 
 fn get_game_entry_point() -> *mut u8 {
     unsafe {
-        let base = GetModuleHandleA(std::ptr::null());
-        if base == 0 { return std::ptr::null_mut(); }
+        let base = match GetModuleHandleA(None) {
+            Ok(h) => h.0 as *const u8,
+            Err(_) => return std::ptr::null_mut(),
+        };
 
-        let dos_header = base as *const u8;
+        let dos_header = base;
         let e_lfanew = *(dos_header.add(0x3C) as *const u32);
         let nt_headers = dos_header.add(e_lfanew as usize);
         let addr_of_ep = *(nt_headers.add(40) as *const u32);
@@ -101,18 +120,24 @@ pub extern "system" fn launch_unity() -> i32 {
         log("OEP Hijack triggered. Launching Unity Engine...");
 
         // Generic Plugin Loader
-        let plugins_dir = "plugins";
-        if std::path::Path::new(plugins_dir).is_dir() {
+        let plugins_dir = if let Some(ref dir) = DLL_DIRECTORY {
+            dir.join("plugins")
+        } else {
+            PathBuf::from("plugins")
+        };
+
+        if plugins_dir.is_dir() {
             log("Scanning 'plugins' directory for additional mods...");
-            if let Ok(entries) = std::fs::read_dir(plugins_dir) {
+            if let Ok(entries) = std::fs::read_dir(&plugins_dir) {
                 for entry in entries.filter_map(|e| e.ok()) {
                     let path = entry.path();
-                    if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("dll") {
+                    if path.is_file()
+                        && path.extension().and_then(|s| s.to_str()) == Some("dll")
+                    {
                         if let Some(path_str) = path.to_str() {
                             let mut w_path: Vec<u16> = path_str.encode_utf16().collect();
                             w_path.push(0);
-                            let h_mod = LoadLibraryW(w_path.as_ptr());
-                            if h_mod != 0 {
+                            if let Ok(_h_mod) = LoadLibraryW(PCWSTR(w_path.as_ptr())) {
                                 log(&format!("Successfully loaded plugin: {}", path_str));
                             } else {
                                 log(&format!("Failed to load plugin: {}", path_str));
@@ -126,44 +151,51 @@ pub extern "system" fn launch_unity() -> i32 {
         }
 
         let unity_path: Vec<u16> = "UnityPlayer.dll\0".encode_utf16().collect();
-        let h_unity = LoadLibraryW(unity_path.as_ptr());
-        if h_unity == 0 {
+        let h_unity = LoadLibraryW(PCWSTR(unity_path.as_ptr()));
+        if h_unity.is_err() {
             log("FATAL: UnityPlayer.dll not found.");
             return 1;
         }
+        let h_unity = h_unity.unwrap();
 
-        let unity_main_ptr = GetProcAddress(h_unity, b"UnityMain\0".as_ptr());
+        let unity_main_ptr = GetProcAddress(h_unity, PCSTR(b"UnityMain\0".as_ptr()));
         if let Some(unity_main_fn) = unity_main_ptr {
             let unity_main: extern "system" fn(HINSTANCE, *mut c_void, *const u16, i32) -> i32 =
                 std::mem::transmute(unity_main_fn);
 
-            let mut cmd_ptr = GetCommandLineW();
+            let mut cmd_ptr = GetCommandLineW().0;
             if !cmd_ptr.is_null() {
                 let mut in_quotes = false;
                 let mut i = 0;
                 loop {
                     let c = *cmd_ptr.add(i);
-                    if c == 0 { break; }
-                    if c == b'"' as u16 { in_quotes = !in_quotes; }
+                    if c == 0 {
+                        break;
+                    }
+                    if c == b'"' as u16 {
+                        in_quotes = !in_quotes;
+                    }
                     if c == b' ' as u16 && !in_quotes {
                         i += 1;
-                        while *cmd_ptr.add(i) == b' ' as u16 { i += 1; }
+                        while *cmd_ptr.add(i) == b' ' as u16 {
+                            i += 1;
+                        }
                         cmd_ptr = cmd_ptr.add(i);
                         break;
                     }
                     i += 1;
                 }
             }
-            
+
             log("Handing execution to UnityMain.");
-            
+
             std::arch::asm!(
                 "and rsp, -16", // 16-byte alignment
                 "sub rsp, 32",  // Shadow space
                 "call rax",     // Call UnityMain
                 "add rsp, 32",  // Clean up
                 in("rax") unity_main,
-                in("rcx") GetModuleHandleA(std::ptr::null()),
+                in("rcx") GetModuleHandleA(None).map(|h| h.0 as *mut c_void).unwrap_or(std::ptr::null_mut()),
                 in("rdx") 0,
                 in("r8") cmd_ptr,
                 in("r9") 1,
@@ -180,12 +212,21 @@ pub extern "system" fn launch_unity() -> i32 {
 
 #[no_mangle]
 pub extern "system" fn DllMain(
-    _module: HINSTANCE,
+    _module: HMODULE,
     reason: u32,
     _reserved: *mut c_void,
 ) -> BOOL {
     if reason == DLL_PROCESS_ATTACH {
         unsafe {
+            let mut path_buf = [0u16; 512];
+            let len = GetModuleFileNameW(Some(_module), &mut path_buf);
+            if len > 0 {
+                let dll_path = String::from_utf16_lossy(&path_buf[..len as usize]);
+                if let Some(pos) = dll_path.rfind('\\') {
+                    DLL_DIRECTORY = Some(PathBuf::from(&dll_path[..pos]));
+                }
+            }
+
             truncate_log();
             log("=== GateJumper Payload loaded ===");
 
@@ -197,8 +238,15 @@ pub extern "system" fn DllMain(
                 return 0;
             }
 
-            let mut old_protect = 0;
-            if VirtualProtect(ep as _, 14, PAGE_EXECUTE_READWRITE, &mut old_protect) != 0 {
+            let mut old_protect = PAGE_EXECUTE_READWRITE;
+            if VirtualProtect(
+                ep as _,
+                14,
+                PAGE_EXECUTE_READWRITE,
+                &mut old_protect,
+            )
+            .is_ok()
+            {
                 let target = launch_unity as *const () as usize;
 
                 // 64-bit absolute jump: ff 25 00 00 00 00 [8-byte addr]

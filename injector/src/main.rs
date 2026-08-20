@@ -1,6 +1,9 @@
 //! GateJumper Injector
 //!
-//! Spawns process suspended and injects payload via APC.
+//! Spawns the target game process suspended and injects gatejumper.dll via APC.
+//! Always targets the real game executable directly — never substitutes a
+//! different binary.  gatejumper.dll handles the appropriate bypass strategy
+//! based on the packing layout it detects inside the target process.
 
 #![windows_subsystem = "windows"]
 #![allow(non_snake_case)]
@@ -29,6 +32,36 @@ unsafe fn log(msg: &str) {
                 let _ = writeln!(file, "[Injector] {}", msg);
             }
         }
+    }
+}
+
+fn normalize_target_path(path: &std::path::Path) -> std::path::PathBuf {
+    let text = path.to_string_lossy();
+    if text.starts_with("/") {
+        let without_prefix = text.trim_start_matches('/');
+        let normalized = without_prefix.replace('/', "\\");
+        let windows_path = if normalized.starts_with("\\") {
+            format!("Z:{}", normalized)
+        } else {
+            format!("Z:\\{}", normalized)
+        };
+        return std::path::PathBuf::from(windows_path);
+    }
+
+    if text.contains('/') && !text.contains(':') {
+        let normalized = text.replace('/', "\\");
+        return std::path::PathBuf::from(normalized);
+    }
+
+    path.to_path_buf()
+}
+
+fn select_payload_for_target(target_name: &str) -> &'static str {
+    let lower = target_name.to_ascii_lowercase();
+    if lower.contains("dmm") || lower.contains("gameplayer") {
+        "dmmhook.dll"
+    } else {
+        "gatejumper.dll"
     }
 }
 
@@ -63,13 +96,14 @@ fn main() {
                     .to_lowercase()
                     == "exe"
                 {
-                    let name = path
+                    let normalized = normalize_target_path(&path);
+                    let name = normalized
                         .file_name()
                         .map(|s| s.to_string_lossy().to_lowercase())
                         .unwrap_or_default();
                     if name != our_name && name != "start.exe" {
-                        log(&format!("Found target exe in args: {:?}", path));
-                        target_exe = Some(path);
+                        log(&format!("Found target exe in args: {:?}", normalized));
+                        target_exe = Some(normalized);
                         using_args = true;
 
                         let cmd_parts: Vec<String> = args[i..]
@@ -110,8 +144,9 @@ fn main() {
                                 && name != "start.exe"
                                 && !name.contains("uninstall")
                             {
-                                log(&format!("Found local target: {:?}", path));
-                                target_exe = Some(path);
+                                let normalized = normalize_target_path(&path);
+                                log(&format!("Found local target: {:?}", normalized));
+                                target_exe = Some(normalized);
                                 break;
                             }
                         }
@@ -122,8 +157,9 @@ fn main() {
 
         let exe_path = match target_exe {
             Some(p) => {
-                log(&format!("Selected EXE: {:?}", p));
-                p
+                let normalized = normalize_target_path(&p);
+                log(&format!("Selected EXE: {:?}", normalized));
+                normalized
             }
             None => {
                 log("FATAL: Could not find a suitable game executable.");
@@ -177,13 +213,10 @@ fn main() {
             .unwrap_or_default()
             .to_string_lossy()
             .to_lowercase();
-        let hook_dll = if exe_name_lower.contains("dmmgameplayer") {
-            "dmmhook.dll"
-        } else {
-            "gatejumper.dll"
-        };
-
+        let hook_dll = select_payload_for_target(&exe_name_lower);
         let dll_path = format!("{}\\{}\0", our_dir, hook_dll);
+
+        log(&format!("Using payload DLL: {} for target {}", hook_dll, exe_name_lower));
         let dll_bytes = dll_path.as_bytes();
         let alloc_addr = VirtualAllocEx(
             process_info.hProcess,

@@ -1,6 +1,14 @@
-# Force MSVC target — this project only builds for Windows
-[build]
-target = "x86_64-pc-windows-msvc"
+# GateJumper targets Windows/MSVC only, but the build host can be Windows, Linux, or macOS.
+#
+# Native Windows builds:
+#   cargo build --target x86_64-pc-windows-msvc
+#
+# Cross builds from non-Windows hosts:
+#   cargo xbuild
+#   cargo xcheck
+#
+# Keep the target explicit only in the commands/aliases; do not force it globally here,
+# because that prevents host-aware builds and makes Linux/macOS setups behave incorrectly.
 
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]

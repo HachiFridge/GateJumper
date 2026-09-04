@@ -1,11 +1,10 @@
 //! GateJumper Payload
 //!
-//! Proxies system DLL exports, suppresses anti-cheat checks, and performs OEP hijack.
+//! Loads plugins early, then applies the bypass profile detected for the target.
 
-#![windows_subsystem = "windows"]
-#![allow(non_snake_case, non_upper_case_globals)]
+#![allow(non_snake_case)]
 
-use std::{env, ffi::c_void, fs::OpenOptions, io::Write, path::PathBuf};
+use std::{env, ffi::c_void, fs::OpenOptions, io::Write, path::PathBuf, sync::OnceLock};
 
 type BOOL = i32;
 type HINSTANCE = isize;
@@ -38,35 +37,38 @@ impl Default for RuntimeConfig {
     }
 }
 
-fn runtime_config() -> RuntimeConfig {
-    let driver_suppression = env::var("GATEJUMPER_SUPPRESS_DRIVERS")
-        .map(|v| v.eq_ignore_ascii_case("1") || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
-        .unwrap_or(false);
+static RUNTIME_CONFIG: OnceLock<RuntimeConfig> = OnceLock::new();
 
-    let strict_runtime_probe_filter = env::var("GATEJUMPER_STRICT_PROBES")
-        .map(|v| !v.eq_ignore_ascii_case("0") && !v.eq_ignore_ascii_case("false") && !v.eq_ignore_ascii_case("no"))
-        .unwrap_or(true);
+fn runtime_config() -> &'static RuntimeConfig {
+    RUNTIME_CONFIG.get_or_init(|| {
+        let driver_suppression = env::var("GATEJUMPER_SUPPRESS_DRIVERS")
+            .map(|v| v.eq_ignore_ascii_case("1") || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+            .unwrap_or(false);
 
-    RuntimeConfig {
-        driver_suppression,
-        strict_runtime_probe_filter,
-    }
+        let strict_runtime_probe_filter = env::var("GATEJUMPER_STRICT_PROBES")
+            .map(|v| !v.eq_ignore_ascii_case("0") && !v.eq_ignore_ascii_case("false") && !v.eq_ignore_ascii_case("no"))
+            .unwrap_or(true);
+
+        RuntimeConfig { driver_suppression, strict_runtime_probe_filter }
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GameProfile {
     DirectOepUnity,
     HookedRuntimeUnity,
-    PartialCrackproofUnity,
+    PlainUnity,
 }
 
-unsafe fn dll_directory_snapshot() -> Option<PathBuf> {
-    let ptr = std::ptr::addr_of!(DLL_DIRECTORY);
-    (*ptr).as_ref().cloned()
-}
 
+
+
+/// True if the game's own directory uses Windows local redirection
+/// (`*.exe.local` / `*.dll.local` directories, or an `apphelp.dll` shim next
+/// to the game executable). These files live beside the game, never beside an
+/// externally relocated gatejumper.dll.
 fn detect_local_redirection() -> bool {
-    let Some(dir) = (unsafe { dll_directory_snapshot() }) else {
+    let Some(dir) = game_directory() else {
         return false;
     };
 
@@ -83,141 +85,280 @@ fn detect_local_redirection() -> bool {
     saw_local_redirection
 }
 
-fn detect_partial_crackproof_layout() -> bool {
-    let Some(dir) = (unsafe { dll_directory_snapshot() }) else {
+/// True if the current image is a packer's unpacker stub: a `.bind` section, or an
+/// entry point inside a `.text` whose raw size is a tiny fraction of its virtual size.
+/// This is only the packer fingerprint; whether the stub needs bypassing at all
+/// depends on the client's layout (see `detect_game_profile`).
+fn is_crackproof_stub_exe() -> bool {
+    unsafe {
+        let base = match GetModuleHandleA(None) {
+            Ok(h) => h.0 as *const u8,
+            Err(_) => return false,
+        };
+
+        let e_lfanew = *(base.add(0x3C) as *const u32) as usize;
+        let nt_headers = base.add(e_lfanew);
+        let num_sects = *(nt_headers.add(6) as *const u16) as usize;
+        let opt_size = *(nt_headers.add(20) as *const u16) as usize;
+        let ep_rva = *(nt_headers.add(40) as *const u32);
+
+        // Section headers live right after the optional header; keep all reads
+        // inside the always-mapped first page.
+        let sect_off = e_lfanew + 24 + opt_size;
+        if sect_off + num_sects * 40 > 0x1000 {
+            return false;
+        }
+
+        for i in 0..num_sects {
+            let off = sect_off + i * 40;
+            let name = std::slice::from_raw_parts(base.add(off), 8);
+
+            if name.starts_with(b".bind") {
+                return true;
+            }
+
+            let vsize = *(base.add(off + 8) as *const u32);
+            let vaddr = *(base.add(off + 12) as *const u32);
+            let rawsize = *(base.add(off + 16) as *const u32);
+            if name.starts_with(b".text")
+                && vaddr <= ep_rva
+                && ep_rva < vaddr + vsize
+                && rawsize > 0
+                && vsize > 0
+                && (rawsize as f64 / vsize as f64) < 0.1
+            {
+                return true;
+            }
+        }
+
+        false
+    }
+}
+
+/// True if the client ships the packer's full-layout markers. The reliable
+/// signal is `UnityCrashHandler64.exe` next to the game executable — part of the
+/// untouched Unity build, present in every full-layout distribution (Steam and
+/// launcher-managed alike). The `installer/` folder is a Steam-delivery
+/// artifact only, so it counts as an additional signal but is not required.
+/// Full-layout CrackProof stubs fault under Wine/Proton while unpacking and need
+/// the DirectOep bypass. Light-packed clients omit the crash handler.
+///
+/// Markers are read from the *game's* directory (`game_directory`), not from
+/// gatejumper.dll's own directory: the payload may be injected from an external
+/// GateJumper folder (the DMM flow), while these files always ship next to the
+/// game executable.
+fn has_full_crackproof_markers() -> bool {
+    let Some(dir) = game_directory() else {
         return false;
     };
 
-    if detect_local_redirection() || dir.join("installer").is_dir() {
-        return false;
+    dir.join("UnityCrashHandler64.exe").is_file() || dir.join("installer").is_dir()
+}
+
+/// Map a user-supplied profile name onto a concrete profile. Matching is
+/// deliberately forgiving so `plain`, `mod-loader`, `direct-oep`,
+/// `hooked-runtime`, and shorthand forms all resolve; unknown names return
+/// `None` and leave auto-detection untouched.
+fn profile_from_name(name: &str) -> Option<GameProfile> {
+    let lower = name.trim().to_ascii_lowercase();
+    if lower.contains("plain") || lower.contains("loader") || lower.contains("mod") {
+        return Some(GameProfile::PlainUnity);
     }
+    if lower.contains("hook") || lower.contains("runtime") {
+        return Some(GameProfile::HookedRuntimeUnity);
+    }
+    if lower.contains("direct") || lower.contains("oep") {
+        return Some(GameProfile::DirectOepUnity);
+    }
+    None
+}
 
-    let mut saw_gameassembly = false;
-    let mut saw_unityplayer = false;
-
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
+/// Read a `profile = <name>` from an INI file. When `section` is `Some`, only
+/// lines inside the matching `[section]` count; when `None`, the first
+/// `profile` line anywhere counts. Files with no `[section]` headers at all
+/// are treated as a single implicit section, so old sectionless configs keep
+/// working under both modes. `#`/`;` comments and trailing comments are
+/// stripped.
+fn ini_profile_from_file(path: &std::path::Path, section: Option<&str>) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut in_section = section.is_none();
+    let mut saw_section_header = false;
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') {
+            if let Some(rest) = line.strip_prefix('[') {
+                if let Some(name) = rest.strip_suffix(']') {
+                    saw_section_header = true;
+                    in_section = section
+                        .map(|s| name.trim().eq_ignore_ascii_case(s))
+                        .unwrap_or(true);
+                }
             }
-            let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            if !ext.eq_ignore_ascii_case("dll") {
-                continue;
-            }
-
-            let lower = path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
-            if lower == "gameassembly.dll" {
-                saw_gameassembly = true;
-            } else if lower == "unityplayer.dll" {
-                saw_unityplayer = true;
+            continue;
+        }
+        // With headers present, only the requested section counts; without any
+        // headers, the whole file is the implicit section.
+        if !in_section && saw_section_header {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("profile") {
+            if let Some(val) = rest.trim().strip_prefix('=') {
+                let val = val.trim().trim_matches('"');
+                if !val.is_empty() {
+                    return Some(val.to_string());
+                }
             }
         }
     }
-
-    saw_gameassembly && saw_unityplayer
+    None
 }
 
-fn detect_full_crackproof_layout() -> bool {
-    let Some(dir) = (unsafe { dll_directory_snapshot() }) else {
-        return false;
-    };
+/// File name of the current process's image, lowercased — the key used to look
+/// up this game in the multi-profile config's `[<exe name>]` sections.
+fn process_exe_name() -> Option<String> {
+    let mut buf = [0u16; 512];
+    let len = unsafe { GetModuleFileNameW(None, &mut buf) };
+    if len == 0 {
+        return None;
+    }
+    let path = String::from_utf16_lossy(&buf[..len as usize]);
+    std::path::Path::new(&path)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+}
 
-    if detect_local_redirection() {
-        return true;
+/// Resolve the `profile = <name>` override for THIS game from config files, in
+/// priority order:
+///
+///   1. `gatejumper.ini` inside the game's own directory — a per-game
+///      individual config. Highest priority, but DMM wipes the game directory
+///      on updates, so it may vanish.
+///   2. The `[<game exe name>]` section of `gatejumper.ini` beside the payload
+///      (the game root in standalone/Steam installs, the dedicated external
+///      GateJumper folder in the DMM deployment).
+///
+/// Returns the first profile found; `None` leaves auto-detection untouched.
+fn ini_profile_override() -> Option<String> {
+    // 1. Per-game config inside the game's own directory.
+    if let Some(dir) = game_directory() {
+        if let Some(profile) = ini_profile_from_file(&dir.join("gatejumper.ini"), None) {
+            return Some(profile);
+        }
     }
 
-    if dir.join("installer").is_dir() && dir.join("UnityCrashHandler64.exe").is_file() {
-        return true;
-    }
-
-    false
+    // 2. `[<exe name>]` section of the payload-adjacent global config.
+    let dir = dll_directory_snapshot()?;
+    let exe_name = process_exe_name()?;
+    ini_profile_from_file(&dir.join("gatejumper.ini"), Some(&exe_name))
 }
 
 fn detect_game_profile() -> GameProfile {
-    // Explicit overrides are generic and intentionally not game-specific.
+    // Manual overrides take precedence over auto-detection, highest first:
+    //   1. `--profile` on the injector's command line, which the injector
+    //      forwards to this process as GATEJUMPER_PROFILE (in the DMM flow,
+    //      DMM-Hook overwrites this with the per-game profile it resolved)
+    //   2. GATEJUMPER_PROFILE environment variable
+    //   3. `profile = <name>` resolved per game by `ini_profile_override`:
+    //      a `gatejumper.ini` inside the game's directory wins, otherwise the
+    //      `[<game exe name>]` section of the config beside the payload.
+    // Overrides are generic and intentionally not game-specific beyond the
+    // per-game sections.
     if let Ok(profile_var) = env::var("GATEJUMPER_PROFILE") {
-        let lower = profile_var.to_ascii_lowercase();
-        if lower.contains("partial") || lower.contains("crackproof") {
-            return GameProfile::PartialCrackproofUnity;
+        if let Some(profile) = profile_from_name(&profile_var) {
+            log(&format!("Manual profile override via GATEJUMPER_PROFILE: {:?}.", profile));
+            return profile;
         }
-        if lower.contains("hook") || lower.contains("runtime") {
-            return GameProfile::HookedRuntimeUnity;
+    }
+    if let Some(ini_profile) = ini_profile_override() {
+        if let Some(profile) = profile_from_name(&ini_profile) {
+            log(&format!("Manual profile override via gatejumper.ini: {:?}.", profile));
+            return profile;
         }
-        if lower.contains("direct") || lower.contains("oep") {
+    }
+
+    if is_crackproof_stub_exe() {
+        // `.local` DLL redirection is the Cellar/DMM install method — a CrackProof
+        // stub that also has DotLocal files is the DMM client. Full-layout marker
+        // check still applies to distinguish the fault-prone variant.
+        if detect_local_redirection() || has_full_crackproof_markers() {
             return GameProfile::DirectOepUnity;
         }
+        return GameProfile::PlainUnity;
     }
 
-    if detect_local_redirection() {
-        return GameProfile::DirectOepUnity;
-    }
-    if detect_full_crackproof_layout() {
-        return GameProfile::DirectOepUnity;
-    }
-    if detect_partial_crackproof_layout() {
-        return GameProfile::PartialCrackproofUnity;
-    }
-
-    GameProfile::HookedRuntimeUnity
+    // Unpacked clients launch normally and need no bypass. GateJumper acts purely
+    // as an early mod loader: plugins load from DllMain, original entry point kept.
+    GameProfile::PlainUnity
 }
 
 
 
 // --- Logging ---
 
-static mut DLL_DIRECTORY: Option<PathBuf> = None;
+/// Set once in DllMain before any other threads are spawned.
+static DLL_DIRECTORY: OnceLock<PathBuf> = OnceLock::new();
+/// Set once in DllMain. Holds the game executable's directory.
+static PROCESS_DIRECTORY: OnceLock<PathBuf> = OnceLock::new();
+/// Whether the deferred bootstrap thread has been scheduled (written once in DllMain).
 static mut DEFERRED_BOOTSTRAP_SCHEDULED: bool = false;
-static mut CURRENT_PROFILE: GameProfile = GameProfile::HookedRuntimeUnity;
-static mut UNITY_PROXY_MODULE: usize = 0;
 
-// Relay LoadLibraryExW calls for cri_ware_unity to LoadLibraryW so mod hooks fire.
-static mut LOAD_LIBRARY_EX_W_CRIWARE_ORIG: usize = 0;
+fn dll_directory_snapshot() -> Option<&'static PathBuf> {
+    DLL_DIRECTORY.get()
+}
 
-unsafe fn log(msg: &str) {
-    let log_path = if let Some(ref dir) = DLL_DIRECTORY {
-        dir.join("gatejumper.log")
-    } else {
-        PathBuf::from("gatejumper.log")
+fn process_directory_snapshot() -> Option<&'static PathBuf> {
+    PROCESS_DIRECTORY.get()
+}
+
+/// Game directory — process image dir is authoritative; falls back to the
+/// payload's own directory for standalone (non-DMM) installs.
+fn game_directory() -> Option<PathBuf> {
+    process_directory_snapshot()
+        .or_else(|| dll_directory_snapshot())
+        .map(|p| p.clone())
+}
+
+fn log(msg: &str) {
+    let log_path = match DLL_DIRECTORY.get() {
+        Some(dir) => dir.join("gatejumper.log"),
+        None => PathBuf::from("gatejumper.log"),
     };
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
-    {
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
         let _ = writeln!(file, "[GateJumper] {}", msg);
     }
 }
 
-/// Like log() but writes to gatejumper-deferred.log which is never truncated by DllMain.
-unsafe fn log_deferred(msg: &str) {
-    let log_path = if let Some(ref dir) = DLL_DIRECTORY {
-        dir.join("gatejumper-deferred.log")
-    } else {
-        PathBuf::from("gatejumper-deferred.log")
+/// Writes to gatejumper-deferred.log — separate file, never overwritten by session start.
+fn log_deferred(msg: &str) {
+    let log_path = match DLL_DIRECTORY.get() {
+        Some(dir) => dir.join("gatejumper-deferred.log"),
+        None => PathBuf::from("gatejumper-deferred.log"),
     };
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
-    {
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
         let _ = writeln!(file, "[GateJumper-Deferred] {}", msg);
     }
 }
 
-unsafe fn truncate_log() {
-    let log_path = if let Some(ref dir) = DLL_DIRECTORY {
-        dir.join("gatejumper.log")
-    } else {
-        PathBuf::from("gatejumper.log")
+fn log_session_start() {
+    use windows::Win32::System::SystemInformation::GetSystemTime;
+    use windows::Win32::Foundation::SYSTEMTIME;
+    let st: SYSTEMTIME = unsafe { GetSystemTime() };
+    let log_path = match DLL_DIRECTORY.get() {
+        Some(dir) => dir.join("gatejumper.log"),
+        None => PathBuf::from("gatejumper.log"),
     };
-    let _ = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(log_path);
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
+        let _ = writeln!(file,
+            "\n{} {:04}-{:02}-{:02} {:02}:{:02}:{:02} {}",
+            "─".repeat(35),
+            st.wYear, st.wMonth, st.wDay,
+            st.wHour, st.wMinute, st.wSecond,
+            "─".repeat(35),
+        );
+    }
 }
 
 // --- Minimal runtime hooks used by the generic runner ---
@@ -240,8 +381,9 @@ type NtLoadDriverFn = extern "system" fn(*const u16) -> NTSTATUS;
 type NtUnloadDriverFn = extern "system" fn(*const u16) -> NTSTATUS;
 type NtCreateFileFn = extern "system" fn(*mut *mut c_void, u32, *mut c_void, *mut c_void, *mut c_void, u32) -> NTSTATUS;
 
-fn is_suppressed_runtime_probe(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
+/// Returns true if `lower` (already ASCII-lowercased) matches a known anti-cheat
+/// or driver probe pattern that should be suppressed.
+fn is_suppressed_runtime_probe(lower: &str) -> bool {
     let suspect_driver = lower.contains("usrdrv017864") || (lower.contains("usrdrv") && lower.ends_with(".sys"));
     let strict = runtime_config().strict_runtime_probe_filter;
 
@@ -266,10 +408,8 @@ fn resolve_module_directory(module_path: &str) -> Option<PathBuf> {
 }
 
 fn plugin_root_dir() -> PathBuf {
-    unsafe {
-        if let Some(ref dir) = DLL_DIRECTORY {
-            return dir.join("plugins");
-        }
+    if let Some(dir) = DLL_DIRECTORY.get() {
+        return dir.join("plugins");
     }
 
     if let Ok(dir) = env::var("GATEJUMPER_PLUGINS_DIR") {
@@ -309,6 +449,20 @@ fn should_suppress_driver_checks() -> bool {
     runtime_config().driver_suppression
 }
 
+fn log_bootstrap_summary() {
+    let cfg = runtime_config();
+    let profile = detect_game_profile();
+    let gatejumper_plugin_loading = should_auto_load_plugins();
+    log("=== GateJumper Payload loaded ===");
+    log(&format!(
+        "Runtime profile: {:?}; gatejumper_plugin_loading={}, driver_suppression={}, strict_probe_filter={}",
+        profile,
+        gatejumper_plugin_loading,
+        cfg.driver_suppression,
+        cfg.strict_runtime_probe_filter,
+    ));
+}
+
 fn plugin_allowlist() -> Vec<String> {
     env::var("GATEJUMPER_PLUGIN_ALLOWLIST")
         .unwrap_or_default()
@@ -334,22 +488,6 @@ fn is_allowlisted_plugin(path: &std::path::Path) -> bool {
     allowlist.iter().any(|entry| lower == *entry || lower.ends_with(entry))
 }
 
-fn log_bootstrap_summary() {
-    let cfg = runtime_config();
-    let profile = detect_game_profile();
-    let gatejumper_plugin_loading = should_auto_load_plugins();
-    unsafe {
-        log("=== GateJumper Payload loaded ===");
-        log(&format!(
-            "Runtime profile: {:?}; gatejumper_plugin_loading={}, driver_suppression={}, strict_probe_filter={}",
-            profile,
-            gatejumper_plugin_loading,
-            cfg.driver_suppression,
-            cfg.strict_runtime_probe_filter,
-        ));
-    }
-}
-
 unsafe extern "system" fn deferred_runtime_bootstrap(_param: *mut c_void) -> u32 {
     log("Deferred bootstrap thread started.");
     Sleep(250);
@@ -360,12 +498,7 @@ unsafe extern "system" fn deferred_runtime_bootstrap(_param: *mut c_void) -> u32
         log_deferred("Deferred runtime hooks enabled.");
     }
 
-    if CURRENT_PROFILE == GameProfile::PartialCrackproofUnity {
-        relay_criware_load_through_library_w();
-    }
-
     log_deferred("Deferred bootstrap complete.");
-
     0
 }
 
@@ -393,29 +526,21 @@ fn schedule_deferred_runtime_bootstrap() {
 }
 
 fn apply_profile_bootstrap(profile: GameProfile) {
-    unsafe {
-        CURRENT_PROFILE = profile;
-
-        match profile {
-            GameProfile::DirectOepUnity => {
-                patch_entry_point_to_unity("Direct OEP hijack enabled.");
-            }
-            GameProfile::HookedRuntimeUnity => {
-                schedule_deferred_runtime_bootstrap();
-                log("Hooked runtime profile: deferred bootstrap scheduled after DllMain.");
-            }
-            GameProfile::PartialCrackproofUnity => {
-                install_load_library_ex_w_criware_hook();
-                schedule_deferred_runtime_bootstrap();
-                log("Partial profile: original OEP preserved; LoadLibraryExW criware relay installed.");
-            }
+    match profile {
+        GameProfile::DirectOepUnity => {
+            unsafe { patch_entry_point_to_unity("Direct OEP hijack enabled."); }
+        }
+        GameProfile::HookedRuntimeUnity => {
+            schedule_deferred_runtime_bootstrap();
+            log("Hooked runtime profile: deferred bootstrap scheduled after DllMain.");
+        }
+        GameProfile::PlainUnity => {
+            log("Plain Unity profile: no bypass applied; unpacked client launches normally and GateJumper acts as an early mod loader only.");
         }
     }
 }
 
 unsafe fn patch_entry_point_to_unity(message: &str) {
-    // Patching a .bind OEP is correct — the JMP fires before the packer stub runs.
-
     let ep = get_game_entry_point();
     if ep.is_null() {
         log("FATAL: Entry point not found.");
@@ -538,11 +663,22 @@ unsafe extern "system" fn nt_unload_driver_hook(driver_name: *const u16) -> NTST
 }
 
 unsafe extern "system" fn nt_create_file_hook(handle: *mut *mut c_void, access: u32, obj_attr: *mut c_void, io_stat: *mut c_void, alloc: *mut c_void, attrs: u32) -> NTSTATUS {
-    if should_suppress_driver_checks() {
-        if !obj_attr.is_null() {
-            if let Ok(path_str) = PCWSTR(obj_attr as *const u16).to_string() {
-                let lower = path_str.to_ascii_lowercase();
-                if lower.contains("usrdrv017864") || (lower.contains("usrdrv") && lower.ends_with(".sys")) {
+    if should_suppress_driver_checks() && !obj_attr.is_null() {
+        // obj_attr is OBJECT_ATTRIBUTES*. Layout (64-bit):
+        //   +0x00  ULONG  Length          (4 bytes)
+        //   +0x04  (pad)                  (4 bytes)
+        //   +0x08  HANDLE RootDirectory   (8 bytes)
+        //   +0x10  PUNICODE_STRING ObjectName  ← pointer to { USHORT Len, USHORT MaxLen, PWSTR Buffer }
+        let obj_name_ptr = *(obj_attr.add(0x10) as *const *const u8);
+        if !obj_name_ptr.is_null() {
+            // UNICODE_STRING: USHORT Length (+0), USHORT MaxLen (+2), PWSTR Buffer (+8 on 64-bit)
+            let buf_ptr = *(obj_name_ptr.add(8) as *const *const u16);
+            let len_bytes = *(obj_name_ptr as *const u16) as usize;
+            if !buf_ptr.is_null() && len_bytes > 0 {
+                let char_count = len_bytes / 2;
+                let slice = std::slice::from_raw_parts(buf_ptr, char_count);
+                let path_str = String::from_utf16_lossy(slice).to_ascii_lowercase();
+                if path_str.contains("usrdrv017864") || (path_str.contains("usrdrv") && path_str.ends_with(".sys")) {
                     log(&format!("[SUPPRESSED] NtCreateFile for driver: {}", path_str));
                     return NTSTATUS(-2);
                 }
@@ -551,157 +687,6 @@ unsafe extern "system" fn nt_create_file_hook(handle: *mut *mut c_void, access: 
     }
     let orig: NtCreateFileFn = std::mem::transmute(NT_CREATE_FILE_ORIG);
     orig(handle, access, obj_attr, io_stat, alloc, attrs)
-}
-
-/// Poll for cri_ware_unity.dll and relay its load through LoadLibraryW so any
-/// hooked LoadLibraryW installed by a mod loader fires and triggers its init sequence.
-unsafe fn relay_criware_load_through_library_w() {
-    use windows::Win32::Foundation::HMODULE;
-    use windows::Win32::System::ProcessStatus::{
-        EnumProcessModulesEx, GetModuleBaseNameW, GetModuleFileNameExW, LIST_MODULES_ALL,
-    };
-
-    // Maximum wait: 400 × 50 ms = 20 seconds.
-    const MAX_POLLS: u32 = 400;
-    const POLL_INTERVAL_MS: u32 = 50;
-
-    for attempt in 0..MAX_POLLS {
-        Sleep(POLL_INTERVAL_MS);
-
-        let mut modules = vec![HMODULE::default(); 2048];
-        let mut cb_needed = 0u32;
-
-        if EnumProcessModulesEx(
-            windows::Win32::System::Threading::GetCurrentProcess(),
-            modules.as_mut_ptr(),
-            (modules.len() * std::mem::size_of::<HMODULE>()) as u32,
-            &mut cb_needed,
-            LIST_MODULES_ALL,
-        ).is_err() {
-            continue;
-        }
-
-        let count = cb_needed as usize / std::mem::size_of::<HMODULE>();
-        for i in 0..count {
-            let h = modules[i];
-            if h.is_invalid() || h.0 as usize == 0 {
-                continue;
-            }
-
-            let mut name_buf = [0u16; 64];
-            let name_len = GetModuleBaseNameW(
-                windows::Win32::System::Threading::GetCurrentProcess(),
-                Some(h),
-                &mut name_buf,
-            ) as usize;
-            if name_len == 0 {
-                continue;
-            }
-
-            let base_name = String::from_utf16_lossy(&name_buf[..name_len]).to_ascii_lowercase();
-            if !base_name.contains("cri_ware_unity") {
-                continue;
-            }
-
-            // Found it — get the full path and relay through LoadLibraryW.
-            let mut path_buf = [0u16; 520];
-            let path_len = GetModuleFileNameExW(
-                Some(windows::Win32::System::Threading::GetCurrentProcess()),
-                Some(h),
-                &mut path_buf,
-            ) as usize;
-
-            if path_len == 0 {
-                // Fallback: use the base name only.
-                let mut wide: Vec<u16> = base_name.encode_utf16().collect();
-                wide.push(0);
-                log_deferred(&format!(
-                    "cri_ware_unity detected after ~{}ms (path unknown); relaying via LoadLibraryW.",
-                    attempt * POLL_INTERVAL_MS
-                ));
-                let _ = LoadLibraryW(PCWSTR(wide.as_ptr()));
-            } else {
-                let full_path = String::from_utf16_lossy(&path_buf[..path_len]);
-                log_deferred(&format!(
-                    "cri_ware_unity detected after ~{}ms ({}); relaying via LoadLibraryW.",
-                    attempt * POLL_INTERVAL_MS,
-                    full_path
-                ));
-                let _ = LoadLibraryW(PCWSTR(path_buf.as_ptr()));
-            }
-            return;
-        }
-    }
-
-    log_deferred("WARN: cri_ware_unity did not appear within 20s; mod loader relay skipped.");
-}
-
-// Hook LoadLibraryExW to relay cri_ware_unity.dll loads to LoadLibraryW.
-unsafe extern "system" fn load_library_ex_w_criware_hook(
-    filename: PCWSTR,
-    file: *mut c_void,
-    flags: u32,
-) -> HMODULE {
-    type Fn = extern "system" fn(PCWSTR, *mut c_void, u32) -> HMODULE;
-    let orig: Fn = std::mem::transmute(LOAD_LIBRARY_EX_W_CRIWARE_ORIG);
-    let handle = orig(filename, file, flags);
-
-    if !handle.is_invalid() && handle.0 as usize != 0 && !filename.0.is_null() {
-        if let Ok(name) = filename.to_string() {
-            let lower = name.to_ascii_lowercase();
-            let basename = lower
-                .rfind('\\')
-                .or_else(|| lower.rfind('/'))
-                .map(|i| &lower[i + 1..])
-                .unwrap_or(&lower);
-
-            log_deferred(&format!("LoadLibraryExW: {}", basename));
-
-            if basename.contains("cri_ware_unity") {
-                log_deferred(&format!("LoadLibraryExW criware relay: {}; calling LoadLibraryW.", name));
-                log(&format!("LoadLibraryExW criware relay: {}.", name));
-
-                // Remove self — one-shot hook.
-                if let Some(func) = GetProcAddress(
-                    GetModuleHandleA(PCSTR(b"kernel32.dll\0".as_ptr())).unwrap(),
-                    PCSTR(b"LoadLibraryExW\0".as_ptr()),
-                ) {
-                    let _ = minhook::MinHook::disable_hook(func as *mut c_void);
-                    let _ = minhook::MinHook::remove_hook(func as *mut c_void);
-                }
-
-                // Replay through LoadLibraryW so any hooked LoadLibraryW fires.
-                // filename is still valid here (caller's stack).
-                let _ = LoadLibraryW(filename);
-            }
-        }
-    }
-
-    handle
-}
-
-fn install_load_library_ex_w_criware_hook() {
-    unsafe {
-        let k32 = match GetModuleHandleA(PCSTR(b"kernel32.dll\0".as_ptr())) {
-            Ok(h) => h,
-            Err(_) => { log("WARN: criware hook: could not get kernel32 handle."); return; }
-        };
-        let func = match GetProcAddress(k32, PCSTR(b"LoadLibraryExW\0".as_ptr())) {
-            Some(f) => f,
-            None => { log("WARN: criware hook: GetProcAddress(LoadLibraryExW) failed."); return; }
-        };
-        match minhook::MinHook::create_hook(
-            func as *mut c_void,
-            load_library_ex_w_criware_hook as *mut c_void,
-        ) {
-            Ok(trampoline) => {
-                LOAD_LIBRARY_EX_W_CRIWARE_ORIG = trampoline as usize;
-                let _ = minhook::MinHook::enable_hook(func as *mut c_void);
-                log("LoadLibraryExW criware relay hook installed.");
-            }
-            Err(e) => log(&format!("WARN: LoadLibraryExW criware hook failed: {:?}", e)),
-        }
-    }
 }
 
 fn setup_hooks() {
@@ -855,16 +840,12 @@ unsafe fn load_plugins_from_directory() {
                     || lower == "unityplayer.dll"
                     || lower.ends_with(".dll.local")
                 {
-                    unsafe {
-                        log(&format!("Skipping self/conflicting DLL: {}", path.display()));
-                    }
+                    log(&format!("Skipping self/conflicting DLL: {}", path.display()));
                     continue;
                 }
 
                 if !is_allowlisted_plugin(&path) {
-                    unsafe {
-                        log(&format!("Skipping unapproved plugin: {}", path.display()));
-                    }
+                    log(&format!("Skipping unapproved plugin: {}", path.display()));
                     continue;
                 }
 
@@ -872,19 +853,12 @@ unsafe fn load_plugins_from_directory() {
                     let mut w_path: Vec<u16> = path_str.encode_utf16().collect();
                     w_path.push(0);
                     let load_result = unsafe { LoadLibraryW(PCWSTR(w_path.as_ptr())) };
-                    if let Ok(h_mod) = load_result {
-                        unsafe {
+                    match load_result {
+                        Ok(_) => {
                             log(&format!("Successfully loaded plugin: {}", path_str));
-                            if GetProcAddress(h_mod, PCSTR(b"UnityMain\0".as_ptr())).is_some() {
-                                UNITY_PROXY_MODULE = h_mod.0 as usize;
-                                log(&format!("Selected UnityMain provider: {}", path_str));
-                            }
+                            *loaded += 1;
                         }
-                        *loaded += 1;
-                    } else {
-                        unsafe {
-                            log(&format!("Failed to load plugin: {}", path_str));
-                        }
+                        Err(_) => log(&format!("Failed to load plugin: {}", path_str)),
                     }
                 }
             }
@@ -902,17 +876,29 @@ unsafe fn load_plugins_from_directory() {
     log(&format!("Plugin scan complete. Loaded {} external DLL(s).", loaded));
 }
 
+/// Entry point called via the OEP patch — loads and starts UnityPlayer.dll!UnityMain.
+/// Address is taken directly; the `pub` and `#[allow(dead_code)]` suppress the
+/// spurious "unused" warning since the compiler cannot see the OEP jump.
 #[allow(dead_code)]
 pub extern "system" fn launch_unity() -> i32 {
     unsafe {
         log("OEP Hijack triggered. Launching Unity Engine...");
 
-        if UNITY_PROXY_MODULE != 0 {
-            log("Note: UnityMain provider is loaded; Unity will be started via UnityPlayer.dll directly.");
-        }
+        // Prefer to load UnityPlayer.dll from the game's own directory (the process
+        // image directory) so the correct DLL is found even when gatejumper.dll was
+        // injected from an external GateJumper folder (the DMM flow) and the CWD is
+        // not the game directory.
+        let unity_path_str = match process_directory_snapshot() {
+            Some(dir) => {
+                let p = dir.join("UnityPlayer.dll");
+                format!("{}\0", p.display())
+            }
+            None => "UnityPlayer.dll\0".to_string(),
+        };
+        let mut unity_path_w: Vec<u16> = unity_path_str.encode_utf16().collect();
+        unity_path_w.push(0);
 
-        let unity_path: Vec<u16> = "UnityPlayer.dll\0".encode_utf16().collect();
-        let h_unity = match LoadLibraryW(PCWSTR(unity_path.as_ptr())) {
+        let h_unity = match LoadLibraryW(PCWSTR(unity_path_w.as_ptr())) {
             Ok(h) => h,
             Err(_) => {
                 log("FATAL: UnityPlayer.dll not found.");
@@ -963,8 +949,6 @@ pub extern "system" fn launch_unity() -> i32 {
     }
 }
 
-// --- DllMain ---
-
 #[no_mangle]
 pub extern "system" fn DllMain(
     _module: HMODULE,
@@ -978,33 +962,43 @@ pub extern "system" fn DllMain(
             if len > 0 {
                 let dll_path = String::from_utf16_lossy(&path_buf[..len as usize]);
                 if let Some(dir) = resolve_module_directory(&dll_path) {
-                    DLL_DIRECTORY = Some(dir);
+                    let _ = DLL_DIRECTORY.set(dir);
                 }
             }
 
-            truncate_log();
-            let cfg = runtime_config();
-            let plugin_loading_enabled = should_auto_load_plugins();
-            log_bootstrap_summary();
+            // Directory of the game executable — used for packer-layout detection.
+            // In the DMM flow this differs from DLL_DIRECTORY since gatejumper.dll
+            // is injected from an external folder.
+            let mut proc_buf = [0u16; 512];
+            let proc_len = GetModuleFileNameW(None, &mut proc_buf);
+            if proc_len > 0 {
+                let proc_path = String::from_utf16_lossy(&proc_buf[..proc_len as usize]);
+                if let Some(dir) = resolve_module_directory(&proc_path) {
+                    let _ = PROCESS_DIRECTORY.set(dir);
+                }
+            }
+        }
 
-            // GateJumper plugins are an independent early-load mechanism. Load them before the
-            // selected profile starts or returns to the game's original entry point.
+        log_session_start();
+        let plugin_loading_enabled = should_auto_load_plugins();
+        log_bootstrap_summary();
+
+        unsafe {
             if plugin_loading_enabled {
                 load_plugins_from_directory();
                 log("Early GateJumper plugin scan completed before profile bootstrap.");
             }
 
-            if cfg.driver_suppression {
+            if runtime_config().driver_suppression {
                 log("Driver suppression is enabled via GATEJUMPER_SUPPRESS_DRIVERS; runtime interception will be deferred to a post-attach thread.");
             } else {
                 log("Driver suppression remains disabled by default; runtime interception hooks are opt-in only.");
             }
-
-            let profile = detect_game_profile();
-            apply_profile_bootstrap(profile);
-
-            log(&format!("Execution profile selected: {:?}.", profile));
         }
+
+        let profile = detect_game_profile();
+        apply_profile_bootstrap(profile);
+        log(&format!("Execution profile selected: {:?}.", profile));
     }
     1
 }

@@ -1,6 +1,6 @@
 //! GateJumper Payload
 //!
-//! Loads plugins early, then applies the bypass profile detected for the target.
+//! Loads plugins early, then hijacks the entry point directly to UnityPlayer.dll!UnityMain.
 
 #![allow(non_snake_case)]
 
@@ -53,246 +53,6 @@ fn runtime_config() -> &'static RuntimeConfig {
     })
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GameProfile {
-    DirectOepUnity,
-    HookedRuntimeUnity,
-    PlainUnity,
-}
-
-
-
-
-/// True if the game's own directory uses Windows local redirection
-/// (`*.exe.local` / `*.dll.local` directories, or an `apphelp.dll` shim next
-/// to the game executable). These files live beside the game, never beside an
-/// externally relocated gatejumper.dll.
-fn detect_local_redirection() -> bool {
-    let Some(dir) = game_directory() else {
-        return false;
-    };
-
-    let mut saw_local_redirection = false;
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-            if name.ends_with(".exe.local") || name.ends_with(".dll.local") || name == "apphelp.dll" {
-                saw_local_redirection = true;
-                break;
-            }
-        }
-    }
-    saw_local_redirection
-}
-
-/// True if the current image is a packer's unpacker stub: a `.bind` section, or an
-/// entry point inside a `.text` whose raw size is a tiny fraction of its virtual size.
-/// This is only the packer fingerprint; whether the stub needs bypassing at all
-/// depends on the client's layout (see `detect_game_profile`).
-fn is_crackproof_stub_exe() -> bool {
-    unsafe {
-        let base = match GetModuleHandleA(None) {
-            Ok(h) => h.0 as *const u8,
-            Err(_) => return false,
-        };
-
-        let e_lfanew = *(base.add(0x3C) as *const u32) as usize;
-        let nt_headers = base.add(e_lfanew);
-        let num_sects = *(nt_headers.add(6) as *const u16) as usize;
-        let opt_size = *(nt_headers.add(20) as *const u16) as usize;
-        let ep_rva = *(nt_headers.add(40) as *const u32);
-
-        // Section headers live right after the optional header; keep all reads
-        // inside the always-mapped first page.
-        let sect_off = e_lfanew + 24 + opt_size;
-        if sect_off + num_sects * 40 > 0x1000 {
-            return false;
-        }
-
-        for i in 0..num_sects {
-            let off = sect_off + i * 40;
-            let name = std::slice::from_raw_parts(base.add(off), 8);
-
-            if name.starts_with(b".bind") {
-                return true;
-            }
-
-            let vsize = *(base.add(off + 8) as *const u32);
-            let vaddr = *(base.add(off + 12) as *const u32);
-            let rawsize = *(base.add(off + 16) as *const u32);
-            if name.starts_with(b".text")
-                && vaddr <= ep_rva
-                && ep_rva < vaddr + vsize
-                && rawsize > 0
-                && vsize > 0
-                && (rawsize as f64 / vsize as f64) < 0.1
-            {
-                return true;
-            }
-        }
-
-        false
-    }
-}
-
-/// True if the client ships the packer's full-layout markers. The reliable
-/// signal is `UnityCrashHandler64.exe` next to the game executable — part of the
-/// untouched Unity build, present in every full-layout distribution (Steam and
-/// launcher-managed alike). The `installer/` folder is a Steam-delivery
-/// artifact only, so it counts as an additional signal but is not required.
-/// Full-layout CrackProof stubs fault under Wine/Proton while unpacking and need
-/// the DirectOep bypass. Light-packed clients omit the crash handler.
-///
-/// Markers are read from the *game's* directory (`game_directory`), not from
-/// gatejumper.dll's own directory: the payload may be injected from an external
-/// GateJumper folder (the DMM flow), while these files always ship next to the
-/// game executable.
-fn has_full_crackproof_markers() -> bool {
-    let Some(dir) = game_directory() else {
-        return false;
-    };
-
-    dir.join("UnityCrashHandler64.exe").is_file() || dir.join("installer").is_dir()
-}
-
-/// Map a user-supplied profile name onto a concrete profile. Matching is
-/// deliberately forgiving so `plain`, `mod-loader`, `direct-oep`,
-/// `hooked-runtime`, and shorthand forms all resolve; unknown names return
-/// `None` and leave auto-detection untouched.
-fn profile_from_name(name: &str) -> Option<GameProfile> {
-    let lower = name.trim().to_ascii_lowercase();
-    if lower.contains("plain") || lower.contains("loader") || lower.contains("mod") {
-        return Some(GameProfile::PlainUnity);
-    }
-    if lower.contains("hook") || lower.contains("runtime") {
-        return Some(GameProfile::HookedRuntimeUnity);
-    }
-    if lower.contains("direct") || lower.contains("oep") {
-        return Some(GameProfile::DirectOepUnity);
-    }
-    None
-}
-
-/// Read a `profile = <name>` from an INI file. When `section` is `Some`, only
-/// lines inside the matching `[section]` count; when `None`, the first
-/// `profile` line anywhere counts. Files with no `[section]` headers at all
-/// are treated as a single implicit section, so old sectionless configs keep
-/// working under both modes. `#`/`;` comments and trailing comments are
-/// stripped.
-fn ini_profile_from_file(path: &std::path::Path, section: Option<&str>) -> Option<String> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let mut in_section = section.is_none();
-    let mut saw_section_header = false;
-    for raw_line in content.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
-            continue;
-        }
-        if line.starts_with('[') {
-            if let Some(rest) = line.strip_prefix('[') {
-                if let Some(name) = rest.strip_suffix(']') {
-                    saw_section_header = true;
-                    in_section = section
-                        .map(|s| name.trim().eq_ignore_ascii_case(s))
-                        .unwrap_or(true);
-                }
-            }
-            continue;
-        }
-        // With headers present, only the requested section counts; without any
-        // headers, the whole file is the implicit section.
-        if !in_section && saw_section_header {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("profile") {
-            if let Some(val) = rest.trim().strip_prefix('=') {
-                let val = val.trim().trim_matches('"');
-                if !val.is_empty() {
-                    return Some(val.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
-/// File name of the current process's image, lowercased — the key used to look
-/// up this game in the multi-profile config's `[<exe name>]` sections.
-fn process_exe_name() -> Option<String> {
-    let mut buf = [0u16; 512];
-    let len = unsafe { GetModuleFileNameW(None, &mut buf) };
-    if len == 0 {
-        return None;
-    }
-    let path = String::from_utf16_lossy(&buf[..len as usize]);
-    std::path::Path::new(&path)
-        .file_name()
-        .map(|s| s.to_string_lossy().to_ascii_lowercase())
-}
-
-/// Resolve the `profile = <name>` override for THIS game from config files, in
-/// priority order:
-///
-///   1. `gatejumper.ini` inside the game's own directory — a per-game
-///      individual config. Highest priority, but DMM wipes the game directory
-///      on updates, so it may vanish.
-///   2. The `[<game exe name>]` section of `gatejumper.ini` beside the payload
-///      (the game root in standalone/Steam installs, the dedicated external
-///      GateJumper folder in the DMM deployment).
-///
-/// Returns the first profile found; `None` leaves auto-detection untouched.
-fn ini_profile_override() -> Option<String> {
-    // 1. Per-game config inside the game's own directory.
-    if let Some(dir) = game_directory() {
-        if let Some(profile) = ini_profile_from_file(&dir.join("gatejumper.ini"), None) {
-            return Some(profile);
-        }
-    }
-
-    // 2. `[<exe name>]` section of the payload-adjacent global config.
-    let dir = dll_directory_snapshot()?;
-    let exe_name = process_exe_name()?;
-    ini_profile_from_file(&dir.join("gatejumper.ini"), Some(&exe_name))
-}
-
-fn detect_game_profile() -> GameProfile {
-    // Manual overrides take precedence over auto-detection, highest first:
-    //   1. `--profile` on the injector's command line, which the injector
-    //      forwards to this process as GATEJUMPER_PROFILE (in the DMM flow,
-    //      DMM-Hook overwrites this with the per-game profile it resolved)
-    //   2. GATEJUMPER_PROFILE environment variable
-    //   3. `profile = <name>` resolved per game by `ini_profile_override`:
-    //      a `gatejumper.ini` inside the game's directory wins, otherwise the
-    //      `[<game exe name>]` section of the config beside the payload.
-    // Overrides are generic and intentionally not game-specific beyond the
-    // per-game sections.
-    if let Ok(profile_var) = env::var("GATEJUMPER_PROFILE") {
-        if let Some(profile) = profile_from_name(&profile_var) {
-            log(&format!("Manual profile override via GATEJUMPER_PROFILE: {:?}.", profile));
-            return profile;
-        }
-    }
-    if let Some(ini_profile) = ini_profile_override() {
-        if let Some(profile) = profile_from_name(&ini_profile) {
-            log(&format!("Manual profile override via gatejumper.ini: {:?}.", profile));
-            return profile;
-        }
-    }
-
-    if is_crackproof_stub_exe() {
-        // `.local` DLL redirection is the Cellar/DMM install method — a CrackProof
-        // stub that also has DotLocal files is the DMM client. Full-layout marker
-        // check still applies to distinguish the fault-prone variant.
-        if detect_local_redirection() || has_full_crackproof_markers() {
-            return GameProfile::DirectOepUnity;
-        }
-        return GameProfile::PlainUnity;
-    }
-
-    // Unpacked clients launch normally and need no bypass. GateJumper acts purely
-    // as an early mod loader: plugins load from DllMain, original entry point kept.
-    GameProfile::PlainUnity
-}
 
 
 
@@ -305,20 +65,8 @@ static PROCESS_DIRECTORY: OnceLock<PathBuf> = OnceLock::new();
 /// Whether the deferred bootstrap thread has been scheduled (written once in DllMain).
 static mut DEFERRED_BOOTSTRAP_SCHEDULED: bool = false;
 
-fn dll_directory_snapshot() -> Option<&'static PathBuf> {
-    DLL_DIRECTORY.get()
-}
-
 fn process_directory_snapshot() -> Option<&'static PathBuf> {
     PROCESS_DIRECTORY.get()
-}
-
-/// Game directory — process image dir is authoritative; falls back to the
-/// payload's own directory for standalone (non-DMM) installs.
-fn game_directory() -> Option<PathBuf> {
-    process_directory_snapshot()
-        .or_else(|| dll_directory_snapshot())
-        .map(|p| p.clone())
 }
 
 fn log(msg: &str) {
@@ -451,12 +199,10 @@ fn should_suppress_driver_checks() -> bool {
 
 fn log_bootstrap_summary() {
     let cfg = runtime_config();
-    let profile = detect_game_profile();
     let gatejumper_plugin_loading = should_auto_load_plugins();
     log("=== GateJumper Payload loaded ===");
     log(&format!(
-        "Runtime profile: {:?}; gatejumper_plugin_loading={}, driver_suppression={}, strict_probe_filter={}",
-        profile,
+        "DirectOEP mode; gatejumper_plugin_loading={}, driver_suppression={}, strict_probe_filter={}",
         gatejumper_plugin_loading,
         cfg.driver_suppression,
         cfg.strict_runtime_probe_filter,
@@ -502,7 +248,6 @@ unsafe extern "system" fn deferred_runtime_bootstrap(_param: *mut c_void) -> u32
     0
 }
 
-
 fn schedule_deferred_runtime_bootstrap() {
     unsafe {
         if DEFERRED_BOOTSTRAP_SCHEDULED {
@@ -521,21 +266,6 @@ fn schedule_deferred_runtime_bootstrap() {
 
         if _thread.is_err() {
             log("WARN: Failed to create deferred bootstrap thread.");
-        }
-    }
-}
-
-fn apply_profile_bootstrap(profile: GameProfile) {
-    match profile {
-        GameProfile::DirectOepUnity => {
-            unsafe { patch_entry_point_to_unity("Direct OEP hijack enabled."); }
-        }
-        GameProfile::HookedRuntimeUnity => {
-            schedule_deferred_runtime_bootstrap();
-            log("Hooked runtime profile: deferred bootstrap scheduled after DllMain.");
-        }
-        GameProfile::PlainUnity => {
-            log("Plain Unity profile: no bypass applied; unpacked client launches normally and GateJumper acts as an early mod loader only.");
         }
     }
 }
@@ -986,19 +716,18 @@ pub extern "system" fn DllMain(
         unsafe {
             if plugin_loading_enabled {
                 load_plugins_from_directory();
-                log("Early GateJumper plugin scan completed before profile bootstrap.");
+                log("Early GateJumper plugin scan completed.");
             }
 
             if runtime_config().driver_suppression {
-                log("Driver suppression is enabled via GATEJUMPER_SUPPRESS_DRIVERS; runtime interception will be deferred to a post-attach thread.");
+                log("Driver suppression is enabled via GATEJUMPER_SUPPRESS_DRIVERS; scheduling deferred runtime interception.");
+                schedule_deferred_runtime_bootstrap();
             } else {
                 log("Driver suppression remains disabled by default; runtime interception hooks are opt-in only.");
             }
-        }
 
-        let profile = detect_game_profile();
-        apply_profile_bootstrap(profile);
-        log(&format!("Execution profile selected: {:?}.", profile));
+            patch_entry_point_to_unity("Direct OEP hijack enabled.");
+        }
     }
     1
 }

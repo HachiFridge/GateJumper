@@ -65,8 +65,8 @@ fn log_session_start() {
 
 // --- Configuration ---
 //
-// The multi-profile `gatejumper.ini` beside dmmhook.dll (the dedicated
-// GateJumper folder, which DMM never touches) drives everything:
+// The `gatejumper.ini` beside dmmhook.dll (the dedicated GateJumper folder,
+// which DMM never touches) drives everything:
 //
 //   [main]
 //   dmm = true
@@ -74,12 +74,10 @@ fn log_session_start() {
 //
 //   [ExampleGame.exe]
 //   dir = <game directory>
-//   profile = direct-oep
 //   plugins = true            # optional; omit to load if plugins/ exists
 //
 //   [AnotherGame.exe]
 //   dir = <game directory>
-//   profile = plain
 //   plugins = false           # disable plugin loading for this game
 //
 // The config is parsed exactly once when the DLL loads. On every process spawn
@@ -89,14 +87,12 @@ fn log_session_start() {
 // process actually launched from). A game with no config entry at all is
 // launched normally — no injection, no bypass, no mod loading — unless its own
 // directory contains a `gatejumper.dll` (a standalone install that DMM now
-// launches), which counts as an implicit match with an auto-detected profile.
+// launches), which counts as an implicit match.
 
 #[derive(Clone, Debug, Default)]
 struct GameEntry {
     /// Directory the game is expected to live in (from `dir = <path>`).
     target_dir: Option<PathBuf>,
-    /// Raw `profile = <name>` value, if any.
-    profile: Option<String>,
     /// Explicit plugin-loading override (`plugins = true/false`). `None` means
     /// inherit the default behaviour (load if `plugins/` directory exists).
     plugins: Option<bool>,
@@ -135,8 +131,8 @@ fn exe_name_from_section(section: &str) -> String {
         .unwrap_or_else(|| section.trim().to_ascii_lowercase())
 }
 
-/// Parse the multi-profile config. Files without any `[section]` header are
-/// treated as belonging to `[main]`, keeping old single-profile configs valid.
+/// Parse the multi-game config. Files without any `[section]` header are
+/// treated as belonging to `[main]`, keeping old single-game configs valid.
 fn parse_config(content: &str) -> HookConfig {
     let mut cfg = HookConfig::default();
     let mut section = String::from("main");
@@ -187,15 +183,6 @@ fn parse_config(content: &str) -> HookConfig {
                     cfg.games.push((exe_name, e));
                 }
             }
-            "profile" => {
-                if let Some((_, e)) = entry {
-                    e.profile = Some(value.to_string());
-                } else {
-                    let mut e = GameEntry::default();
-                    e.profile = Some(value.to_string());
-                    cfg.games.push((exe_name, e));
-                }
-            }
             "plugins" => {
                 let enabled = value.eq_ignore_ascii_case("true")
                     || value.eq_ignore_ascii_case("yes")
@@ -219,40 +206,6 @@ fn parse_config(content: &str) -> HookConfig {
     cfg
 }
 
-/// Map a user-supplied profile name onto its canonical GateJumper form, mirroring
-/// the payload's lenient matching. Unknown values return `None` (auto-detect).
-fn canonical_profile(name: &str) -> Option<&'static str> {
-    let lower = name.trim().to_ascii_lowercase();
-    if lower.contains("plain") || lower.contains("loader") || lower.contains("mod") {
-        Some("plain")
-    } else if lower.contains("hook") || lower.contains("runtime") {
-        Some("hooked-runtime")
-    } else if lower.contains("direct") || lower.contains("oep") {
-        Some("direct-oep")
-    } else {
-        None
-    }
-}
-
-/// Read the first `profile = <name>` from an INI file regardless of section —
-/// the per-game individual config that may live inside the game's directory.
-fn read_ini_profile_unscoped(ini_path: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(ini_path).ok()?;
-    for raw_line in content.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("profile") {
-            if let Some(val) = rest.trim().strip_prefix('=') {
-                let val = strip_trailing_comment(val.trim()).trim().trim_matches('"');
-                if !val.is_empty() { return Some(val.to_string()); }
-            }
-        }
-    }
-    None
-}
-
 /// Compare two directory paths case-insensitively, normalizing slashes and
 /// trailing separators. A Linux-style absolute target (`/media/…`) is mapped
 /// through the prefix's `Z:` drive first, so it compares equal to the Windows
@@ -272,8 +225,6 @@ fn dirs_equal(a: &Path, b: &Path) -> bool {
 
 /// Result of matching a spawned game against the configuration.
 struct MatchResult {
-    /// Canonical profile to force, or `None` for auto-detection.
-    profile: Option<&'static str>,
     /// Explicit plugin-loading override, or `None` to use the default
     /// (load if `plugins/` directory exists beside the payload).
     plugins: Option<bool>,
@@ -287,13 +238,8 @@ fn resolve_match(exe_name: &str, exe_dir: &Path) -> Option<MatchResult> {
     // 1. Individual config inside the game directory — highest priority.
     let game_ini = exe_dir.join("gatejumper.ini");
     if game_ini.is_file() {
-        let profile = read_ini_profile_unscoped(&game_ini);
-        if let Some(p) = &profile {
-            log(&format!("Game '{}': profile '{}' from game-directory gatejumper.ini.", exe_name, p));
-        } else {
-            log(&format!("Game '{}': matched via game-directory gatejumper.ini (no profile; auto-detect).", exe_name));
-        }
-        return Some(MatchResult { profile: profile.as_deref().and_then(canonical_profile), plugins: None });
+        log(&format!("Game '{}': matched via game-directory gatejumper.ini.", exe_name));
+        return Some(MatchResult { plugins: None });
     }
 
     // 2. `[<exe name>]` section of the global config beside dmmhook.dll.
@@ -309,22 +255,17 @@ fn resolve_match(exe_name: &str, exe_dir: &Path) -> Option<MatchResult> {
                 }
             }
 
-            let profile = entry.profile.as_deref().and_then(canonical_profile);
             let plugins = entry.plugins;
-            match profile {
-                Some(p) => log(&format!("Game '{}': matched global config, profile '{}'{}.", exe_name, p,
-                    plugins.map(|v| format!(", plugins={}", v)).unwrap_or_default())),
-                None => log(&format!("Game '{}': matched global config (no profile; auto-detect){}.", exe_name,
-                    plugins.map(|v| format!(", plugins={}", v)).unwrap_or_default())),
-            }
-            return Some(MatchResult { profile, plugins });
+            log(&format!("Game '{}': matched global config{}.", exe_name,
+                plugins.map(|v| format!(", plugins={}", v)).unwrap_or_default()));
+            return Some(MatchResult { plugins });
         }
     }
 
     // 3. Implicit match via standalone gatejumper.dll in the game's directory.
     if exe_dir.join("gatejumper.dll").is_file() {
-        log(&format!("Game '{}': matched via gatejumper.dll in game directory (auto-detect).", exe_name));
-        return Some(MatchResult { profile: None, plugins: None });
+        log(&format!("Game '{}': matched via gatejumper.dll in game directory.", exe_name));
+        return Some(MatchResult { plugins: None });
     }
 
     None
@@ -511,7 +452,7 @@ fn process_identity(
 
 // --- OEP injection ---
 
-unsafe fn inject_into_suspended_process(pi: &PROCESS_INFORMATION, profile: Option<&str>, plugins: Option<bool>) -> bool {
+unsafe fn inject_into_suspended_process(pi: &PROCESS_INFORMATION, plugins: Option<bool>) -> bool {
     let base = match get_process_image_base(pi.hProcess) {
         Some(b) => b, None => { log("Failed to get ImageBase."); return false; }
     };
@@ -540,7 +481,7 @@ unsafe fn inject_into_suspended_process(pi: &PROCESS_INFORMATION, profile: Optio
     let orig_0_7  = u64::from_le_bytes(orig[0..8].try_into().unwrap());
     let orig_8_15 = u64::from_le_bytes(orig[8..16].try_into().unwrap());
 
-    // Resolve LoadLibraryA, VirtualProtect (and, for profile overrides,
+    // Resolve LoadLibraryA, VirtualProtect (and, for plugins override,
     // SetEnvironmentVariableA) via local kernel32 offsets — avoids remote
     // module enumeration. System DLLs map at the same base in every process,
     // so the local base + export offset holds in the child too.
@@ -549,19 +490,8 @@ unsafe fn inject_into_suspended_process(pi: &PROCESS_INFORMATION, profile: Optio
     let load_lib_addr = k32.0 as usize + (lla as usize - k32.0 as usize);
     let vp = GetProcAddress(k32, PCSTR(b"VirtualProtect\0".as_ptr())).unwrap();
     let virtual_protect_addr = k32.0 as usize + (vp as usize - k32.0 as usize);
-    // Only forward a profile override if one wasn't already set upstream by the
-    // injector via `--profile`. The injector writes GATEJUMPER_PROFILE into
-    // DMMGamePlayer's environment, which dmmhook.dll inherits; if it's present
-    // here it means the user explicitly chose a profile at launch time and we
-    // must not overwrite it with the per-game config value.
-    let effective_profile = if std::env::var("GATEJUMPER_PROFILE").is_ok() {
-        log("GATEJUMPER_PROFILE already set by injector; per-game profile override skipped.");
-        None
-    } else {
-        profile
-    };
 
-    let setenv_addr = if effective_profile.is_some() || plugins.is_some() {
+    let setenv_addr = if plugins.is_some() {
         let sea = GetProcAddress(k32, PCSTR(b"SetEnvironmentVariableA\0".as_ptr())).unwrap();
         Some(k32.0 as usize + (sea as usize - k32.0 as usize))
     } else {
@@ -625,36 +555,21 @@ unsafe fn inject_into_suspended_process(pi: &PROCESS_INFORMATION, profile: Optio
     sc.extend_from_slice(&[0u8; 8]);
     sc.extend_from_slice(&[0x48,0xB8]); sc.extend_from_slice(&(virtual_protect_addr as u64).to_le_bytes());
     sc.extend_from_slice(&[0xFF,0xD0]);
-    // Call SetEnvironmentVariableA for each forced env var — GATEJUMPER_PROFILE
-    // when a profile is specified, GATEJUMPER_LOAD_PLUGINS when plugins is
-    // explicitly overridden. All address operands are placeholders patched once
-    // the remote allocation exists.
-    let mut env_profile_name_operand  = 0usize;
-    let mut env_profile_value_operand = 0usize;
+
+    // Call SetEnvironmentVariableA for GATEJUMPER_LOAD_PLUGINS when plugins is explicitly overridden.
     let mut env_plugins_name_operand  = 0usize;
     let mut env_plugins_value_operand = 0usize;
     if let Some(sea) = setenv_addr {
-        // SetEnvironmentVariableA("GATEJUMPER_PROFILE", value)
         sc.extend_from_slice(&[0x48,0xB9]); // mov rcx, <name addr>
-        env_profile_name_operand = sc.len();
+        env_plugins_name_operand = sc.len();
         sc.extend_from_slice(&[0u8; 8]);
         sc.extend_from_slice(&[0x48,0xBA]); // mov rdx, <value addr>
-        env_profile_value_operand = sc.len();
+        env_plugins_value_operand = sc.len();
         sc.extend_from_slice(&[0u8; 8]);
         sc.extend_from_slice(&[0x48,0xB8]); sc.extend_from_slice(&(sea as u64).to_le_bytes());
         sc.extend_from_slice(&[0xFF,0xD0]); // call SetEnvironmentVariableA
-
-        if plugins.is_some() {
-            sc.extend_from_slice(&[0x48,0xB9]);
-            env_plugins_name_operand = sc.len();
-            sc.extend_from_slice(&[0u8; 8]);
-            sc.extend_from_slice(&[0x48,0xBA]);
-            env_plugins_value_operand = sc.len();
-            sc.extend_from_slice(&[0u8; 8]);
-            sc.extend_from_slice(&[0x48,0xB8]); sc.extend_from_slice(&(sea as u64).to_le_bytes());
-            sc.extend_from_slice(&[0xFF,0xD0]);
-        }
     }
+
     // LoadLibraryA(dll_path).
     sc.extend_from_slice(&[0x48,0xB9]);
     let dll_path_operand = sc.len();
@@ -670,26 +585,11 @@ unsafe fn inject_into_suspended_process(pi: &PROCESS_INFORMATION, profile: Optio
     sc.extend_from_slice(&[0xFF,0xE0]);
 
     // Allocate RW, write shellcode, then promote to RX — never EXECUTE_READWRITE.
-    // The remote allocation holds:
-    //   [0..sc.len())                  shellcode
-    //   [path_offset..)                dll path string
-    //   [profile_name_offset..)        "GATEJUMPER_PROFILE\0"        (always present)
-    //   [profile_value_offset..)       profile value string           (when profile forced)
-    //   [plugins_name_offset..)        "GATEJUMPER_LOAD_PLUGINS\0"   (when plugins forced)
-    //   [plugins_value_offset..)       "1\0" or "0\0"                (when plugins forced)
-    //   [old_protect_1_offset..)       4-byte DWORD — output of first VirtualProtect call
-    //   [old_protect_2_offset..)       4-byte DWORD — output of second VirtualProtect call
-    // Each VirtualProtect gets its own output slot so the first call's saved
-    // protection value is preserved and not overwritten by the second call.
-    let profile_env_name  = "GATEJUMPER_PROFILE\0";
-    let profile_env_value: String = effective_profile.map(|p| format!("{}\0", p)).unwrap_or_default();
     let plugins_env_name  = "GATEJUMPER_LOAD_PLUGINS\0";
     let plugins_env_value: String = plugins.map(|v| if v { "1\0".to_string() } else { "0\0".to_string() }).unwrap_or_default();
 
     let path_offset           = (sc.len() + 7) & !7;
-    let profile_name_offset   = path_offset + dll_path.len();
-    let profile_value_offset  = profile_name_offset + profile_env_name.len();
-    let plugins_name_offset   = profile_value_offset + profile_env_value.len();
+    let plugins_name_offset   = path_offset + dll_path.len();
     let plugins_value_offset  = plugins_name_offset + plugins_env_name.len();
     let old_protect_1_offset  = (plugins_value_offset + plugins_env_value.len() + 7) & !7;
     let old_protect_2_offset  = old_protect_1_offset + 4;
@@ -712,15 +612,6 @@ unsafe fn inject_into_suspended_process(pi: &PROCESS_INFORMATION, profile: Optio
     let dll_path_addr = alloc as usize + path_offset;
     sc[dll_path_operand..dll_path_operand + 8].copy_from_slice(&(dll_path_addr as u64).to_le_bytes());
 
-    // Patch GATEJUMPER_PROFILE operands (always written even if value is empty,
-    // so the name/value slot offsets are stable; the shellcode only calls
-    // SetEnvironmentVariableA when setenv_addr is Some).
-    if env_profile_name_operand != 0 {
-        let pn_addr = alloc as usize + profile_name_offset;
-        let pv_addr = alloc as usize + profile_value_offset;
-        sc[env_profile_name_operand..env_profile_name_operand + 8].copy_from_slice(&(pn_addr as u64).to_le_bytes());
-        sc[env_profile_value_operand..env_profile_value_operand + 8].copy_from_slice(&(pv_addr as u64).to_le_bytes());
-    }
     if env_plugins_name_operand != 0 {
         let ln_addr = alloc as usize + plugins_name_offset;
         let lv_addr = alloc as usize + plugins_value_offset;
@@ -731,19 +622,11 @@ unsafe fn inject_into_suspended_process(pi: &PROCESS_INFORMATION, profile: Optio
     let mut written = 0usize;
     let _ = WriteProcessMemory(pi.hProcess, dll_path_addr as *mut c_void,
         dll_path.as_ptr() as *const c_void, dll_path.len(), Some(&mut written));
-    if setenv_addr.is_some() {
-        let _ = WriteProcessMemory(pi.hProcess, (alloc as usize + profile_name_offset) as *mut c_void,
-            profile_env_name.as_ptr() as *const c_void, profile_env_name.len(), Some(&mut written));
-        if !profile_env_value.is_empty() {
-            let _ = WriteProcessMemory(pi.hProcess, (alloc as usize + profile_value_offset) as *mut c_void,
-                profile_env_value.as_ptr() as *const c_void, profile_env_value.len(), Some(&mut written));
-        }
-        if plugins.is_some() {
-            let _ = WriteProcessMemory(pi.hProcess, (alloc as usize + plugins_name_offset) as *mut c_void,
-                plugins_env_name.as_ptr() as *const c_void, plugins_env_name.len(), Some(&mut written));
-            let _ = WriteProcessMemory(pi.hProcess, (alloc as usize + plugins_value_offset) as *mut c_void,
-                plugins_env_value.as_ptr() as *const c_void, plugins_env_value.len(), Some(&mut written));
-        }
+    if plugins.is_some() {
+        let _ = WriteProcessMemory(pi.hProcess, (alloc as usize + plugins_name_offset) as *mut c_void,
+            plugins_env_name.as_ptr() as *const c_void, plugins_env_name.len(), Some(&mut written));
+        let _ = WriteProcessMemory(pi.hProcess, (alloc as usize + plugins_value_offset) as *mut c_void,
+            plugins_env_value.as_ptr() as *const c_void, plugins_env_value.len(), Some(&mut written));
     }
     let _ = WriteProcessMemory(pi.hProcess, alloc, sc.as_ptr() as *const c_void, sc.len(), Some(&mut written));
 
@@ -760,11 +643,9 @@ unsafe fn inject_into_suspended_process(pi: &PROCESS_INFORMATION, profile: Optio
         tramp.as_ptr() as *const c_void, 16, Some(&mut written));
     let _ = VirtualProtectEx(pi.hProcess, oep_addr as *mut c_void, 16, PAGE_EXECUTE_READ, &mut old);
 
-    match (effective_profile, plugins) {
-        (Some(p), Some(l)) => log(&format!("OEP hijacked (GATEJUMPER_PROFILE={}, GATEJUMPER_LOAD_PLUGINS={}).", p, if l { "1" } else { "0" })),
-        (Some(p), None)    => log(&format!("OEP hijacked (GATEJUMPER_PROFILE={}).", p)),
-        (None,    Some(l)) => log(&format!("OEP hijacked (GATEJUMPER_LOAD_PLUGINS={}).", if l { "1" } else { "0" })),
-        (None,    None)    => log("OEP hijacked."),
+    match plugins {
+        Some(l) => log(&format!("OEP hijacked (GATEJUMPER_LOAD_PLUGINS={}).", if l { "1" } else { "0" })),
+        None    => log("OEP hijacked."),
     }
     true
 }
@@ -841,7 +722,7 @@ unsafe extern "system" fn create_process_w_hook(
                 match resolve_match(&exe_name, &exe_dir) {
                     Some(m) => {
                         log(&format!("Game '{}' matched configuration; injecting.", exe_name));
-                        let injected = inject_into_suspended_process(pi, m.profile, m.plugins);
+                        let injected = inject_into_suspended_process(pi, m.plugins);
                         if !caller_wanted_suspended {
                             ResumeThread(pi.hThread);
                             log(if injected { "Resumed with payload." } else { "Injection failed; resumed." });
@@ -1054,14 +935,14 @@ pub extern "system" fn DllMain(_module: HINSTANCE, reason: u32, _reserved: *mut 
             log_session_start();
             log("=== DMM-Hook loaded ===");
 
-            // Read the multi-profile config exactly once.
+            // Read the multi-game config exactly once.
             let config = DLL_DIRECTORY.get()
                 .map(|d| d.join("gatejumper.ini"))
                 .and_then(|p| std::fs::read_to_string(p).ok())
                 .map(|content| parse_config(&content))
                 .unwrap_or_default();
             log(&format!(
-                "Config loaded: dmm={}, main.target={:?}, {} game profile(s): [{}].",
+                "Config loaded: dmm={}, main.target={:?}, {} configured game(s): [{}].",
                 config.dmm,
                 config.main_target,
                 config.games.len(),

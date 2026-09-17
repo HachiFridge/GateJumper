@@ -118,10 +118,9 @@ fn strip_trailing_comment(line: &str) -> &str {
     line
 }
 
-/// Read `target` / `dmm` keys from the `[main]` section of the multi-profile
-/// `gatejumper.ini`. Files without `[section]` headers are treated as
-/// `[main]`, keeping old single-profile configs valid; per-game sections are
-/// deliberately ignored here — DMM-Hook consumes those inside the launcher.
+/// Read `target` / `dmm` keys from the `[main]` section of `gatejumper.ini`.
+/// Files without `[section]` headers are treated as `[main]`; per-game
+/// sections are deliberately ignored here — DMM-Hook consumes those inside the launcher.
 /// Returns `(target_value, is_dmm_shorthand)`.
 fn read_main_ini(ini_path: &std::path::Path) -> Option<(Option<String>, bool)> {
     let content = std::fs::read_to_string(ini_path).ok()?;
@@ -183,22 +182,6 @@ fn scan_dir_for_exe(
     None
 }
 
-/// Map a user-supplied profile name onto its canonical form if it is a known
-/// GateJumper profile; `None` otherwise. Unknown values are deliberately left
-/// alone so a game-owned `--profile=...` argument passes through untouched.
-fn canonical_profile_name(name: &str) -> Option<&'static str> {
-    let lower = name.trim().to_ascii_lowercase();
-    if lower.contains("plain") || lower.contains("loader") || lower.contains("mod") {
-        Some("plain")
-    } else if lower.contains("hook") || lower.contains("runtime") {
-        Some("hooked-runtime")
-    } else if lower.contains("direct") || lower.contains("oep") {
-        Some("direct-oep")
-    } else {
-        None
-    }
-}
-
 fn main() {
     unsafe {
         let args: Vec<String> = std::env::args().collect();
@@ -225,44 +208,6 @@ fn main() {
             .and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_lowercase()))
             .unwrap_or_else(|| "injector.exe".to_string());
 
-        // --- Manual profile override (command line) ---
-        // `--profile <name>` / `--profile=<name>` is accepted anywhere on the
-        // command line (Steam launch options put it before or after
-        // `%command%`). It is forwarded to the payload as GATEJUMPER_PROFILE so
-        // the child process inherits it. Only values resolving to a known
-        // profile are consumed; anything else is left untouched so a
-        // game-owned `--profile=...` argument passes through to the game.
-        let mut profile_override: Option<&'static str> = None;
-        let mut consumed_arg_idx: Vec<usize> = Vec::new();
-        {
-            let mut arg_iter = args.iter().enumerate().skip(1).peekable();
-            while let Some((i, arg)) = arg_iter.next() {
-                let (value_idx, raw_value): (Option<usize>, Option<&str>) =
-                    if let Some(v) = arg.strip_prefix("--profile=") {
-                        (None, Some(v))
-                    } else if arg == "--profile" {
-                        match arg_iter.peek() {
-                            Some((j, next)) => (Some(*j), Some(next.trim_matches('"'))),
-                            None => (None, None),
-                        }
-                    } else {
-                        (None, None)
-                    };
-
-                let Some(raw) = raw_value else { continue };
-                let Some(canonical) = canonical_profile_name(raw) else {
-                    continue; // not a GateJumper profile; treat as a game argument
-                };
-
-                profile_override = Some(canonical);
-                consumed_arg_idx.push(i);
-                if let Some(j) = value_idx {
-                    consumed_arg_idx.push(j);
-                    arg_iter.next(); // skip the value token
-                }
-                log(&format!("--profile override: {}", canonical));
-            }
-        }
 
         // --- Target resolution ---
 
@@ -339,11 +284,9 @@ fn main() {
                         log(&format!("Found target exe in args[{}]: {:?}", i, normalized));
                         target_exe = Some(normalized);
                         using_args = true;
-                        // Reconstruct command line from this arg forward, minus
-                        // any GateJumper flags consumed above.
-                        let cmd_parts: Vec<String> = args.iter().enumerate().skip(i)
-                            .filter(|(idx, _)| !consumed_arg_idx.contains(idx))
-                            .map(|(_, s)| if s.contains(' ') && !s.starts_with('"') {
+                        // Reconstruct command line from this arg forward.
+                        let cmd_parts: Vec<String> = args.iter().skip(i)
+                            .map(|s| if s.contains(' ') && !s.starts_with('"') {
                                 format!("\"{}\"", s)
                             } else { s.clone() })
                             .collect();
@@ -382,14 +325,6 @@ fn main() {
             None => { log("FATAL: Could not find a suitable target executable."); return; }
         };
 
-        // Forward a manual profile override to the payload via the environment:
-        // the child inherits this process's environment, so gatejumper.dll picks
-        // it up from GATEJUMPER_PROFILE inside the game (and so does the game
-        // when a launcher spawns it later, e.g. the DMM Game Player flow).
-        if let Some(profile) = profile_override {
-            std::env::set_var("GATEJUMPER_PROFILE", profile);
-            log(&format!("GATEJUMPER_PROFILE={} set for child process.", profile));
-        }
 
         let exe_name_w: Vec<u16> = exe_path
             .to_string_lossy()

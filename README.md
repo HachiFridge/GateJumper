@@ -40,7 +40,7 @@ Because the stub is never allowed to run, it cannot fault under Wine/Proton.
 |---|---|
 | `injector.exe` | Launch wrapper. Spawns the target process suspended and injects `gatejumper.dll` via APC. Rename to `start.exe` for deployment. |
 | `gatejumper.dll` | Core payload. Detects the packing layout, loads plugins, and performs the appropriate bypass. |
-| `dmmhook.dll` | DMM Game Player hook. Injected into the launcher; intercepts all process-launch APIs (`CreateProcessW/A`, `ShellExecuteW/A/ExW`, `WinExec`), then injects `gatejumper.dll` — resolved from its own directory — into the game when the launcher starts it. |
+| `dmmhook.dll` | DMM launcher hook. Injected into DMM Game Player or DMM Fast Launcher; intercepts process-launch APIs (`CreateProcessW/A`, `ShellExecuteW/A/ExW`, `WinExec`), follows the launcher's own runtime child (PyInstaller one-file) and arms command interpreters that carry a configured game, then injects `gatejumper.dll` — resolved from its own directory — when the game starts. |
 
 ## Building
 
@@ -58,187 +58,31 @@ cargo xbuild
 
 Outputs land at `target/x86_64-pc-windows-msvc/release/`.
 
-## Installation
+Unit tests (shellcode layout assertions, Wine/prefix path resolution, carrier
+matching, command-line splitting):
 
-### Steam (Windows & Linux)
-
-1. Copy `injector.exe` (rename it `start.exe`) and `gatejumper.dll` into the
-   game's root directory, next to `UnityPlayer.dll`.
-2. Optionally create a `plugins/` folder and place `.dll` plugins inside it.
-3. Set the Steam Launch Options:
-
-   **Windows:**
-   ```
-   "C:\path\to\game\start.exe" %command%
-   ```
-
-   **Linux / Proton** — replace `Game.exe` with the actual executable name:
-   ```sh
-   eval $(echo "%command%" | sed 's/Game\.exe/start\.exe/')
-   ```
-
-4. Launch normally via Steam.
-
-### Non-Steam (Windows & Linux/Wine)
-
-Place `start.exe` and `gatejumper.dll` in the game root, then use any of the
-following:
-
-**Config file (`gatejumper.ini` beside `start.exe`):**
-```ini
-# Direct game target — relative (resolved against this file's directory)
-# or absolute:
-target = Game.exe
-
-# Or, to route through DMM Game Player:
-# dmm = true
+```sh
+cargo test --target x86_64-pc-windows-msvc
 ```
 
-**No configuration:** just run `start.exe` from the game's root directory — it
-finds the game executable itself (see [Target Resolution](#target-resolution)).
+## Usage
 
-### DMM Game Player
+Installation and launch setup (Steam, non-Steam, DMM Game Player, DMM Fast
+Launcher), plugin loading, configuration, target resolution and logging are
+documented in **[USAGE.md](USAGE.md)**.
 
-> **Important:** DMM-managed games require authentication tokens that DMM Game
-> Player passes to the game at launch. Launching the game executable directly
-> from its folder **will fail** — the game contacts DMM servers and finds no
-> valid session. You must route the launch through DMM Game Player.
-
-> **DMM updates wipe DMM Game Player's own directory and the game's directory,
-> reinstalling both from scratch.** Nothing GateJumper-related may live inside
-> either tree. Instead, keep the entire setup in a folder of its own anywhere
-> else on the system: GateJumper injects both the launcher hook and the game
-> payload from that folder by absolute path, so neither managed directory is
-> ever touched and updates cannot break the installation.
-
-1. Create a GateJumper folder outside both DMM Game Player's directory and the
-   game's directory (e.g. `C:\GateJumper` on Windows, or `/media/…/GateJumper`
-   on Linux) and copy `injector.exe` (rename to `start.exe`), `dmmhook.dll`,
-   `gatejumper.dll`, and optionally a `plugins/` folder into it. Both DLLs must
-   sit next to `start.exe` — the injector refuses to run without them.
-2. Create a `gatejumper.ini` beside `start.exe` that routes the launch through
-   DMM Game Player (this also makes double-click launching work) and lists the
-   games DMM-Hook should arm. The file uses one section per game, keyed by the
-   game executable's file name:
-
-   ```ini
-   [main]
-   dmm = true
-   # Optional: point at an explicit DMM Game Player install directory instead
-   # of auto-detecting the standard locations:
-   # target = C:\Program Files\DMMGamePlayer
-
-   [ExampleGame.exe]
-   dir = C:\Games\ExampleGame
-   plugins = true             # explicit: load plugins/ for this game
-
-   [AnotherGame.exe]
-   dir = C:\Games\AnotherGame
-   plugins = false            # explicit: skip plugin loading for this game
-   ```
-
-   `[main]` is read by the injector: `dmm = true` routes the launch through
-   DMM Game Player, and the optional `target` names the launcher's install
-   directory (a bare `DMMGamePlayer.exe` path also works). Each `[<exe>]`
-   section is read by DMM-Hook: when DMM Game Player spawns that executable,
-   `gatejumper.dll` is injected with the listed `plugins` override (`true`/`false`;
-   omit to use the default — load if a `plugins/` directory exists beside the payload). The
-   section's `dir`, when present, must match where the game
-   actually launched from.
-
-   Games that match no section are launched completely normally — no
-   injection, no bypass, no mod loading — with one exception: a game whose own
-   directory contains a `gatejumper.dll` (a standalone install that DMM now
-   launches) counts as implicitly armed, and the payload is injected.
-
-   On Linux/Wine the same ini works — `dir` accepts a Windows path
-   (`C:\...`, `Z:\...`), a Linux path reachable through the prefix's `Z:`
-   drive, or a relative path. See [Target Resolution](#target-resolution).
-
-3. Launch `start.exe` (double-click, or `wine start.exe` on Linux). The
-   injector spawns DMM Game Player suspended and injects `dmmhook.dll` from
-   the GateJumper folder.
-4. Click Play in DMM. The hook intercepts the authenticated game launch,
-   matches the spawned executable against the configuration, and injects
-   `gatejumper.dll` — again resolved from the GateJumper folder, never from
-   the game's directory — so the bypass is applied and plugins load from
-   `<GateJumper folder>/plugins`.
-
-   A `gatejumper.ini` sitting inside a game's own directory is treated as that
-   game's individual config:
-
-   ```ini
-   # <game directory>/gatejumper.ini
-   plugins = false
-   ```
-
-   This lets per-game settings survive independently of the GateJumper
-   folder. DMM update cycles wipe the game directory (nuking this file too), at
-   which point DMM-Hook falls back to the `[<exe>]` section of the config in
-   the GateJumper folder.
-
-Installing the files into the game's root folder instead still works, but DMM
-update cycles delete them; the dedicated folder above survives untouched.
-
-## Plugin Loading
-
-Place `.dll` plugin files in a `plugins/` folder next to the GateJumper
-binaries — the game root in standalone/Steam installs, or the dedicated
-GateJumper folder in the [DMM Game Player](#dmm-game-player) deployment.
-GateJumper scans this directory during `DllMain` and loads each DLL via
-`LoadLibraryW` before the bypass fires, ensuring plugins are active before
-Unity starts.
-
-Optionally restrict loading to specific DLLs with `GATEJUMPER_PLUGIN_ALLOWLIST`
-(see [Environment Variables](#environment-variables)).
-
-## Configuration
-
-### Target Resolution
-
-The executable the injector spawns is chosen from the first match of:
-
-1. `gatejumper.ini` — `[main]`: `target = <path>` or `dmm = true`.
-2. The first `.exe` argument on the command line (the Steam `%command%`
-   passthrough).
-3. A scan of `start.exe`'s own directory (skipping itself, crash handlers,
-   and uninstallers).
-
-A `[main]` `target` naming a *directory* is treated as the DMM Game Player
-install folder and `DMMGamePlayer.exe` is appended; naming an executable uses
-it directly.
-
-`target` values may be any of:
-
-- a **relative path** — resolved against the ini's directory, so `Game.exe` or
-  `./Game.exe` both mean the game root that holds `start.exe`. Works under every
-  prefix and drive mapping, so it is the recommended form.
-- a **Windows path** — used as-is, e.g. `D:\games\Game.exe` or `Z:\media\...`.
-  Any drive letter the prefix actually provides works, including non-`Z:`
-  mappings made by a prefix manager.
-- a **Linux path** — e.g. `/media/extra/.../Game.exe` — translated through the
-  prefix's `Z:` drive (Wine mounts `/` as `Z:` by default) and only accepted if
-  the file is reachable there. Prefixes that remap or remove `Z:` hide their
-  drive mappings from the process, so in that case use a relative or Windows
-  path instead (you can get the latter once with `winepath -w`).
-
-### Environment Variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `GATEJUMPER_LOAD_PLUGINS` | *(auto: on if `plugins/` exists)* | `1` / `true` to force-enable, `0` / `false` to disable plugin loading. |
-| `GATEJUMPER_PLUGIN_ALLOWLIST` | *(unset — load all)* | Comma-separated list of plugin filenames to restrict loading to. |
-| `GATEJUMPER_PLUGINS_DIR` | `<payload folder>/plugins` (the game root in standalone/Steam installs, the GateJumper folder in the DMM flow) | Override the plugin directory path. |
-| `GATEJUMPER_SUPPRESS_DRIVERS` | `0` | Set to `1` to intercept `NtLoadDriver` / `NtCreateFile` for known anti-cheat driver names. |
-| `GATEJUMPER_STRICT_PROBES` | `1` | Set to `0` to narrow the driver suppression filter to driver filenames only. |
+The short version: put `start.exe` + `gatejumper.dll` in the game's root
+directory (or in a dedicated folder of their own for DMM launchers, adding
+`dmmhook.dll`), point the launch at `start.exe`, and add `plugins/` next to
+the binaries to load mods.
 
 ## Logs
 
-`gatejumper.log` is written next to the loaded binaries — the game root in
-standalone/Steam installs, the dedicated GateJumper folder in the
-[DMM Game Player](#dmm-game-player) deployment. Each launch appends to this
-file with a timestamped separator (`─── YYYY-MM-DD HH:MM:SS ───`), so the full
-history of all sessions is preserved. The injector writes its lines before the
-payload loads, making it the first place to check if something goes wrong.
-Deferred-runtime activity is logged separately to `gatejumper-deferred.log` in
-the same folder.
+`gatejumper.log` next to the loaded binaries — see
+[USAGE.md § Logs](USAGE.md#logs).
+
+## Acknowledgements
+
+- **[FunnyHoney](https://gitlab.com/LeadRDRK/FunnyHoney)** (LeadRDRK) — The foundational proof-of-concept that demonstrated bypassing commercial anti-cheat stubs, inspiring GateJumper's non-destructive runtime injection design.
+- **[Cellar](https://github.com/Hachimi-Hachimi/Cellar)** — Early exploration of Windows DLL redirection and environment isolation under Wine/Proton.
+- **[MinHook](https://github.com/TsudaKageyu/minhook)** — Minimalistic x86/x64 API hooking library for Windows.

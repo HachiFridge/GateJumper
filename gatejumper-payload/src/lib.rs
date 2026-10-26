@@ -90,6 +90,21 @@ fn log_deferred(msg: &str) {
     }
 }
 
+const MAX_LAUNCH_ENTRIES: usize = 5;
+
+fn count_launch_entries(content: &str) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    for line in content.lines() {
+        if line.contains("───────────────────────────────────") {
+            let trimmed = line.trim_matches(|c| c == '─' || c == ' ' || c == '\r' || c == '\n');
+            if !trimmed.is_empty() {
+                seen.insert(trimmed);
+            }
+        }
+    }
+    seen.len()
+}
+
 fn log_session_start() {
     use windows::Win32::System::SystemInformation::GetSystemTime;
     use windows::Win32::Foundation::SYSTEMTIME;
@@ -98,12 +113,32 @@ fn log_session_start() {
         Some(dir) => dir.join("gatejumper.log"),
         None => PathBuf::from("gatejumper.log"),
     };
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
-        let _ = writeln!(file,
-            "\n{} {:04}-{:02}-{:02} {:02}:{:02}:{:02} {}",
+    let deferred_path = match DLL_DIRECTORY.get() {
+        Some(dir) => dir.join("gatejumper-deferred.log"),
+        None => PathBuf::from("gatejumper-deferred.log"),
+    };
+
+    let time_str = format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
+    );
+
+    if let Ok(content) = std::fs::read_to_string(&log_path) {
+        if content.contains(&time_str) {
+            return;
+        }
+        if count_launch_entries(&content) >= MAX_LAUNCH_ENTRIES {
+            let _ = std::fs::remove_file(&log_path);
+            let _ = std::fs::remove_file(&deferred_path);
+        }
+    }
+
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
+        let _ = writeln!(
+            file,
+            "\n{} {} {}",
             "─".repeat(35),
-            st.wYear, st.wMonth, st.wDay,
-            st.wHour, st.wMinute, st.wSecond,
+            time_str,
             "─".repeat(35),
         );
     }
@@ -606,18 +641,35 @@ unsafe fn load_plugins_from_directory() {
     log(&format!("Plugin scan complete. Loaded {} external DLL(s).", loaded));
 }
 
-/// Entry point called via the OEP patch — loads and starts UnityPlayer.dll!UnityMain.
-/// Address is taken directly; the `pub` and `#[allow(dead_code)]` suppress the
-/// spurious "unused" warning since the compiler cannot see the OEP jump.
+/// Split a command line after argv[0]. Empty when no trailing arguments, so
+/// `UnityMain` never sees the exe path itself (WinMain `lpCmdLine` semantics).
+fn command_line_tail(cmd: &[u16]) -> &[u16] {
+    let mut in_quotes = false;
+    for (i, &c) in cmd.iter().enumerate() {
+        if c == b'"' as u16 {
+            in_quotes = !in_quotes;
+        } else if c == b' ' as u16 && !in_quotes {
+            let rest = &cmd[i + 1..];
+            let start = match rest.iter().position(|&c| c != b' ' as u16) {
+                Some(p) => i + 1 + p,
+                None => return &[],
+            };
+            return &cmd[start..];
+        }
+    }
+    &[]
+}
+
+/// Called via the OEP patch — loads UnityPlayer.dll!UnityMain. The `pub` and
+/// `#[allow(dead_code)]` suppress the unused warning (the OEP jump is invisible
+/// to the compiler).
 #[allow(dead_code)]
 pub extern "system" fn launch_unity() -> i32 {
     unsafe {
         log("OEP Hijack triggered. Launching Unity Engine...");
 
-        // Prefer to load UnityPlayer.dll from the game's own directory (the process
-        // image directory) so the correct DLL is found even when gatejumper.dll was
-        // injected from an external GateJumper folder (the DMM flow) and the CWD is
-        // not the game directory.
+        // Load UnityPlayer.dll from the game's own directory (process image
+        // directory) — the CWD isn't the game dir in the DMM flow.
         let unity_path_str = match process_directory_snapshot() {
             Some(dir) => {
                 let p = dir.join("UnityPlayer.dll");
@@ -641,31 +693,24 @@ pub extern "system" fn launch_unity() -> i32 {
             let unity_main: extern "system" fn(HINSTANCE, *mut c_void, *const u16, i32) -> i32 =
                 std::mem::transmute(unity_main_fn);
 
-            // Get the command line and skip argv[0] (the game exe path), passing
-            // only the trailing arguments to UnityMain.
-            let mut cmd_ptr = GetCommandLineW().0;
-            if !cmd_ptr.is_null() {
-                let mut in_quotes = false;
-                let mut i = 0;
-                loop {
-                    let c = *cmd_ptr.add(i);
-                    if c == 0 {
-                        break;
-                    }
-                    if c == b'"' as u16 {
-                        in_quotes = !in_quotes;
-                    }
-                    if c == b' ' as u16 && !in_quotes {
-                        i += 1;
-                        while *cmd_ptr.add(i) == b' ' as u16 {
-                            i += 1;
-                        }
-                        cmd_ptr = cmd_ptr.add(i);
-                        break;
-                    }
-                    i += 1;
+            // Skip argv[0]; pass an empty string when there are no trailing arguments.
+            static EMPTY_CMDLINE: [u16; 1] = [0];
+            let raw = GetCommandLineW().0;
+            let cmd_ptr: *const u16 = if raw.is_null() {
+                EMPTY_CMDLINE.as_ptr()
+            } else {
+                let mut len = 0usize;
+                while *raw.add(len) != 0 {
+                    len += 1;
                 }
-            }
+                let tail = command_line_tail(std::slice::from_raw_parts(raw, len));
+                if tail.is_empty() {
+                    EMPTY_CMDLINE.as_ptr()
+                } else {
+                    // Tail ends at the original NUL — valid C string in place.
+                    tail.as_ptr()
+                }
+            };
 
             // hInstance = the exe's own module base (GetModuleHandle(NULL)).
             // nCmdShow  = 10 (SW_SHOWDEFAULT).
@@ -676,6 +721,113 @@ pub extern "system" fn launch_unity() -> i32 {
 
         log("FATAL: UnityMain export not found in UnityPlayer.dll.");
         1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn w(s: &str) -> Vec<u16> {
+        s.encode_utf16().collect()
+    }
+
+    fn tail(s: &str) -> String {
+        String::from_utf16(command_line_tail(&w(s))).unwrap()
+    }
+
+    #[test]
+    fn no_trailing_args_yields_empty() {
+        // The regression: the whole (quoted) exe path used to be passed through.
+        assert_eq!(tail(r#""C:\Games\ExampleGame\ExampleGame.exe""#), "");
+        assert_eq!(tail(r#""C:\Program Files\game\game.exe""#), "");
+        assert_eq!(tail(r"C:\Games\game.exe"), "");
+        assert_eq!(tail(""), "");
+        // argv[0] followed only by spaces: still no arguments.
+        assert_eq!(tail(r#""C:\g\game.exe"   "#), "");
+        assert_eq!(tail(r"C:\g\game.exe "), "");
+    }
+
+    #[test]
+    fn trailing_args_are_preserved() {
+        assert_eq!(
+            tail(r#""C:\Games\ExampleGame\ExampleGame.exe" -screen-fullscreen 1"#),
+            "-screen-fullscreen 1"
+        );
+        assert_eq!(tail(r"C:\g\game.exe -a -b"), "-a -b");
+        assert_eq!(
+            tail(r#""C:\Program Files\game.exe" "-batchmode" "-nographics""#),
+            r#""-batchmode" "-nographics""#
+        );
+        // Spaces after argv[0] are collapsed, as before.
+        assert_eq!(tail(r#""C:\g\game.exe"    -arg"#), "-arg");
+    }
+
+    #[test]
+    fn quoted_space_inside_argv0_does_not_split() {
+        assert_eq!(tail(r#""C:\Program Files\My Game\game.exe" /play"#), "/play");
+    }
+
+    #[test]
+    fn count_launch_entries_and_rotation() {
+        let mut log = String::new();
+        assert_eq!(count_launch_entries(&log), 0);
+
+        for i in 1..=5 {
+            log.push_str(&format!(
+                "\n─────────────────────────────────── 2026-10-26 10:00:0{} ───────────────────────────────────\n[GateJumper] Launch {}\n",
+                i, i
+            ));
+            assert_eq!(count_launch_entries(&log), i);
+        }
+
+        // 5 entries reached
+        assert_eq!(count_launch_entries(&log), 5);
+
+        // Duplicate timestamp from same launch session does not increment count
+        let duplicate = log.clone()
+            + "\n─────────────────────────────────── 2026-10-26 10:00:05 ───────────────────────────────────\n[DMM-Hook] Sibling\n";
+        assert_eq!(count_launch_entries(&duplicate), 5);
+    }
+
+    #[test]
+    fn rotation_nukes_on_sixth_launch() {
+        let temp_dir = std::env::temp_dir().join(format!("gj_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let log_file = temp_dir.join("gatejumper.log");
+        let def_file = temp_dir.join("gatejumper-deferred.log");
+
+        // Write 5 launch entries
+        let mut content = String::new();
+        for i in 1..=5 {
+            content.push_str(&format!(
+                "\n─────────────────────────────────── 2026-10-26 10:00:0{} ───────────────────────────────────\n[GateJumper] Entry {}\n",
+                i, i
+            ));
+        }
+        std::fs::write(&log_file, &content).unwrap();
+        std::fs::write(&def_file, "deferred data").unwrap();
+
+        assert_eq!(count_launch_entries(&std::fs::read_to_string(&log_file).unwrap()), 5);
+
+        // 6th launch simulation:
+        if count_launch_entries(&std::fs::read_to_string(&log_file).unwrap()) >= MAX_LAUNCH_ENTRIES {
+            let _ = std::fs::remove_file(&log_file);
+            let _ = std::fs::remove_file(&def_file);
+        }
+
+        assert!(!log_file.exists());
+        assert!(!def_file.exists());
+
+        // Start 1st entry of fresh cycle
+        std::fs::write(
+            &log_file,
+            "\n─────────────────────────────────── 2026-10-26 10:00:06 ───────────────────────────────────\n[GateJumper] Fresh Entry\n",
+        )
+        .unwrap();
+        assert_eq!(count_launch_entries(&std::fs::read_to_string(&log_file).unwrap()), 1);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
 
@@ -696,9 +848,7 @@ pub extern "system" fn DllMain(
                 }
             }
 
-            // Directory of the game executable — used for packer-layout detection.
-            // In the DMM flow this differs from DLL_DIRECTORY since gatejumper.dll
-            // is injected from an external folder.
+            // Game executable's directory — differs from DLL_DIRECTORY in the DMM flow.
             let mut proc_buf = [0u16; 512];
             let proc_len = GetModuleFileNameW(None, &mut proc_buf);
             if proc_len > 0 {

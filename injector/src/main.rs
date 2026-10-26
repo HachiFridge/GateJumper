@@ -1,10 +1,10 @@
-//! GateJumper Injector
+﻿//! GateJumper Injector
 //!
 //! Spawns the target game process suspended and injects gatejumper.dll via APC.
 //!
 //! Target resolution order:
-//!   1. `target` / `dmm` keys in `gatejumper.ini` beside the injector
-//!   2. First `.exe` argument from the command line (Steam `%command%` / launcher chain)
+//!   1. First `.exe` argument (explicit choice beats the ini default)
+//!   2. `target` / `dmm` keys in `gatejumper.ini` beside the injector
 //!   3. Directory scan of the injector's own directory
 
 #![windows_subsystem = "windows"]
@@ -20,6 +20,31 @@ use windows::Win32::System::Threading::{
     CreateProcessW, QueueUserAPC, ResumeThread, TerminateProcess, CREATE_SUSPENDED,
     PROCESS_INFORMATION, STARTUPINFOW,
 };
+
+const MAX_LAUNCH_ENTRIES: usize = 5;
+
+fn count_launch_entries(content: &str) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    for line in content.lines() {
+        if line.contains("───────────────────────────────────") {
+            let trimmed = line.trim_matches(|c| c == '─' || c == ' ' || c == '\r' || c == '\n');
+            if !trimmed.is_empty() {
+                seen.insert(trimmed);
+            }
+        }
+    }
+    seen.len()
+}
+
+fn rotate_log_if_needed(dir: &std::path::Path) {
+    let log_path = dir.join("gatejumper.log");
+    if let Ok(content) = std::fs::read_to_string(&log_path) {
+        if count_launch_entries(&content) >= MAX_LAUNCH_ENTRIES {
+            let _ = std::fs::remove_file(&log_path);
+            let _ = std::fs::remove_file(dir.join("gatejumper-deferred.log"));
+        }
+    }
+}
 
 unsafe fn log(msg: &str) {
     use std::io::Write;
@@ -44,23 +69,13 @@ unsafe fn path_exists_windows(path: &str) -> bool {
     GetFileAttributesW(PCWSTR(wide.as_ptr())) != INVALID_FILE_ATTRIBUTES
 }
 
-/// Classify a raw `target` value from the config or command line into a Windows
-/// path ready for CreateProcessW. Accepted forms:
-///
-///   1. Windows-style: `D:\Games\ExampleGame\Game.exe`, `Z:\…`, `C:\…`, `\\server\share\…`
-///        Used as-is (forward slashes normalized). The drive letter is whatever
-///        the Wine/Proton prefix actually provides, including prefix-manager
-///        mappings that differ from the `Z:` default.
-///   2. Unix absolute: `/media/extra/Games/ExampleGame/Game.exe`
-///        Translated through the `Z:` drive, Wine/Proton's standard mount of
-///        `/`, and verified to exist there. A Windows process cannot discover
-///        how a prefix maps partitions onto drive letters (Wine hides the Unix
-///        targets of QueryDosDeviceW), so when verification fails an actionable
-///        error is returned instead of guessing at other letters.
-///   3. Relative: `Game.exe`, `./Game.exe`, `..\sibling\Game.exe`
-///        Anchored to `base_dir` — the directory holding gatejumper.ini and
-///        start.exe — which is always a working Windows path in the current
-///        prefix, so no drive translation is ever needed.
+/// Classify a raw `target` value into a Windows path for CreateProcessW:
+///   1. Windows-style (`D:\…`, `Z:\…`, `\\server\share`) — used as-is; the
+///      drive letter is whatever the Wine/Proton prefix actually provides.
+///   2. Unix absolute (`/media/…`) — tried as `Z:…` (Wine's mount of `/`)
+///      and via the prefix's `drive_<letter>` mapping, both verified to exist;
+///      otherwise an actionable error instead of guessing drive letters.
+///   3. Relative — anchored to `base_dir` (the GateJumper folder).
 fn resolve_target_value(
     raw: &str,
     base_dir: &std::path::Path,
@@ -81,19 +96,72 @@ fn resolve_target_value(
     }
 
     if text.starts_with('/') {
-        let candidate = format!("Z:{}", text.replace('/', "\\"));
-        if unsafe { path_exists_windows(&candidate) } {
-            return Ok(std::path::PathBuf::from(candidate));
+        let z_candidate = format!("Z:{}", text.replace('/', "\\"));
+        if unsafe { path_exists_windows(&z_candidate) } {
+            return Ok(std::path::PathBuf::from(z_candidate));
         }
+
+        // Prefix managers (Bottles/Lutris/Faugus/Proton/plain Wine) store
+        // drives as drive_c, drive_d, … — try the <letter>:\ view too.
+        if let Some(mapped) = drive_mapped_candidate(&text.to_ascii_lowercase()) {
+            if unsafe { path_exists_windows(&mapped) } {
+                return Ok(std::path::PathBuf::from(mapped));
+            }
+        }
+
         return Err(format!(
-            "'{}' is not reachable as '{}' in this Wine/Proton prefix. Use a path relative to gatejumper.ini (e.g. 'Game.exe'), a Windows path for this prefix (e.g. from 'winepath -w'), or check the prefix's drive mappings.",
-            text, candidate
+            "'{}' is not reachable as '{}' (or its prefix drive mapping) in this Wine/Proton prefix. Use a path relative to gatejumper.ini (e.g. 'Game.exe'), a Windows path for this prefix (e.g. from 'winepath -w'), or check the prefix's drive mappings.",
+            text, z_candidate
         ));
     }
 
     // Relative: anchor to the config's own directory.
     let joined = base_dir.join(text);
     Ok(std::path::PathBuf::from(joined.to_string_lossy().replace('/', "\\")))
+}
+
+/// `/…/drive_c/games/g` → `c:\games\g`; None when no drive_<letter> segment.
+fn drive_mapped_candidate(lower_unix: &str) -> Option<String> {
+    let mut from = 0usize;
+    while let Some(p) = lower_unix[from..].find("/drive_") {
+        let s = from + p;
+        let rest = &lower_unix[s + 7..]; // past "/drive_"
+        let b = rest.as_bytes();
+        if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b'/' {
+            let tail = &rest[1..];
+            return Some(format!("{}:{}", b[0] as char, tail.replace('/', "\\")));
+        }
+        from = s + 7;
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::drive_mapped_candidate;
+
+    #[test]
+    fn drive_mapping_from_prefix_layouts() {
+        // Steam/Proton, Bottles, Lutris, Faugus and plain Wine prefixes all
+        // store drives as drive_c directories inside the prefix.
+        assert_eq!(
+            drive_mapped_candidate("/home/u/.steam/steam/compatdata/123/pfx/drive_c/games/game/game.exe"),
+            Some("c:\\games\\game\\game.exe".to_string())
+        );
+        assert_eq!(
+            drive_mapped_candidate("/home/u/games/drive_d/mods/x.dll"),
+            Some("d:\\mods\\x.dll".to_string())
+        );
+        // No drive segment, or a segment that is not exactly drive_<letter>/.
+        assert_eq!(drive_mapped_candidate("/media/data/games/g.exe"), None);
+        assert_eq!(drive_mapped_candidate("/x/drive_cd/games/g.exe"), None);
+        assert_eq!(drive_mapped_candidate("/x/drive_c"), None);
+        // Tries further occurrences when the first is malformed.
+        assert_eq!(
+            drive_mapped_candidate("/x/drive_1/y/drive_c/z/g.exe"),
+            Some("c:\\z\\g.exe".to_string())
+        );
+    }
 }
 
 fn select_payload_for_target(target_name: &str) -> &'static str {
@@ -184,6 +252,12 @@ fn scan_dir_for_exe(
 
 fn main() {
     unsafe {
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(parent) = exe_path.parent() {
+                rotate_log_if_needed(parent);
+            }
+        }
+
         let args: Vec<String> = std::env::args().collect();
         log(&format!("Starting with args: {:?}", args));
 
@@ -215,8 +289,47 @@ fn main() {
         let mut cmd_line_w: Vec<u16> = Vec::new();
         let mut using_args = false;
 
-        // 1. gatejumper.ini beside the injector — `[main]` section only
-        //    (target = <DMM Game Player directory or exe> / dmm = true)
+        // 1. First .exe in args — explicit choice beats the ini default
+        //    (Steam %command%, launcher chains).
+        if target_exe.is_none() {
+            'arg_scan: for (i, arg) in args.iter().enumerate().skip(1) {
+                // Skip known GateJumper flags
+                if arg.starts_with("--") { continue; }
+                let trimmed = arg.trim_matches('"');
+                let path = std::path::PathBuf::from(trimmed);
+                if path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase() == "exe" {
+                    let normalized = match resolve_target_value(trimmed, &our_dir_path) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            log(&format!("Skipping argument '{}': {}", arg, e));
+                            continue;
+                        }
+                    };
+                    let name = normalized.file_name()
+                        .map(|s| s.to_string_lossy().to_lowercase())
+                        .unwrap_or_default();
+                    if name != our_name && name != "start.exe" {
+                        log(&format!("Found target exe in args[{}]: {:?}", i, normalized));
+                        target_exe = Some(normalized);
+                        using_args = true;
+                        // Reconstruct command line from this arg forward.
+                        let cmd_parts: Vec<String> = args.iter().skip(i)
+                            .map(|s| if s.contains(' ') && !s.starts_with('"') {
+                                format!("\"{}\"", s)
+                            } else { s.clone() })
+                            .collect();
+                        let cmd_str = cmd_parts.join(" ");
+                        log(&format!("Reconstructed cmd: {}", cmd_str));
+                        cmd_line_w = cmd_str.encode_utf16().chain(std::iter::once(0)).collect();
+                        break 'arg_scan;
+                    } else {
+                        log("Arg is injector itself, skipping.");
+                    }
+                }
+            }
+        }
+
+        // 2. gatejumper.ini [main] (target / dmm) — fallback when no .exe arg.
         if target_exe.is_none() {
             let ini_path = our_dir_path.join("gatejumper.ini");
             if let Some((ini_target, dmm_shorthand)) = read_main_ini(&ini_path) {
@@ -262,45 +375,6 @@ fn main() {
             }
         }
 
-        // 2. First .exe in args (Steam %command% / launcher chain passthrough)
-        if target_exe.is_none() {
-            'arg_scan: for (i, arg) in args.iter().enumerate().skip(1) {
-                // Skip known GateJumper flags
-                if arg.starts_with("--") { continue; }
-                let trimmed = arg.trim_matches('"');
-                let path = std::path::PathBuf::from(trimmed);
-                if path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase() == "exe" {
-                    let normalized = match resolve_target_value(trimmed, &our_dir_path) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            log(&format!("Skipping argument '{}': {}", arg, e));
-                            continue;
-                        }
-                    };
-                    let name = normalized.file_name()
-                        .map(|s| s.to_string_lossy().to_lowercase())
-                        .unwrap_or_default();
-                    if name != our_name && name != "start.exe" {
-                        log(&format!("Found target exe in args[{}]: {:?}", i, normalized));
-                        target_exe = Some(normalized);
-                        using_args = true;
-                        // Reconstruct command line from this arg forward.
-                        let cmd_parts: Vec<String> = args.iter().skip(i)
-                            .map(|s| if s.contains(' ') && !s.starts_with('"') {
-                                format!("\"{}\"", s)
-                            } else { s.clone() })
-                            .collect();
-                        let cmd_str = cmd_parts.join(" ");
-                        log(&format!("Reconstructed cmd: {}", cmd_str));
-                        cmd_line_w = cmd_str.encode_utf16().chain(std::iter::once(0)).collect();
-                        break 'arg_scan;
-                    } else {
-                        log("Arg is injector itself, skipping.");
-                    }
-                }
-            }
-        }
-
         // 3. Directory scan of injector's own directory
         if target_exe.is_none() {
             log("No target in config or command line; scanning injector directory...");
@@ -337,11 +411,24 @@ fn main() {
             None
         };
 
+        // Child CWD = the target's own directory, matching a double-click
+        // launch — CWD-sensitive targets (Fast Launcher resolves its `assets`
+        // folder against the CWD) would else inherit start.exe's directory.
+        let exe_dir_w: Vec<u16> = exe_path
+            .parent()
+            .map(|p| p.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect())
+            .unwrap_or_default();
+        let lp_current_dir = if exe_dir_w.is_empty() {
+            PCWSTR(std::ptr::null())
+        } else {
+            PCWSTR(exe_dir_w.as_ptr())
+        };
+
         let success = CreateProcessW(
             PCWSTR(exe_name_w.as_ptr()),
             lp_command_line,
             None, None, false, CREATE_SUSPENDED,
-            None, None, &startup_info, &mut process_info,
+            None, lp_current_dir, &startup_info, &mut process_info,
         );
 
         if success.is_err() {

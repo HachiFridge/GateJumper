@@ -1,8 +1,9 @@
-//! DMM-Hook — injected into the DMM Game Player launcher to intercept game spawns.
+﻿//! DMM-Hook — injected into the DMM Game Player launcher to intercept game spawns.
 
 #![allow(non_snake_case)]
 
 use std::{ffi::c_void, fs::OpenOptions, io::Write, path::{Path, PathBuf}, sync::OnceLock};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 type BOOL = i32;
 type HINSTANCE = isize;
@@ -13,7 +14,7 @@ use windows::{
         Foundation::HWND,
         System::{
             LibraryLoader::{GetModuleHandleA, GetProcAddress, LoadLibraryA},
-            Threading::{PROCESS_INFORMATION, STARTUPINFOW, STARTUPINFOA, ResumeThread},
+            Threading::{PROCESS_INFORMATION, STARTUPINFOW, STARTUPINFOA, QueueUserAPC, ResumeThread},
             Diagnostics::Debug::WriteProcessMemory,
             Memory::{
                 VirtualAllocEx, VirtualProtectEx,
@@ -34,6 +35,9 @@ const SHELL_EXECUTE_SUCCESS: HINSTANCE = 42;
 /// Set once in DllMain before any other threads are spawned.
 static DLL_DIRECTORY: OnceLock<std::path::PathBuf> = OnceLock::new();
 
+/// Lowercased file name + directory of the process this hook runs in.
+static OWN_IMAGE: OnceLock<(String, PathBuf)> = OnceLock::new();
+
 fn log(msg: &str) {
     let log_path = match DLL_DIRECTORY.get() {
         Some(dir) => dir.join("gatejumper.log"),
@@ -44,6 +48,21 @@ fn log(msg: &str) {
     }
 }
 
+const MAX_LAUNCH_ENTRIES: usize = 5;
+
+fn count_launch_entries(content: &str) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    for line in content.lines() {
+        if line.contains("───────────────────────────────────") {
+            let trimmed = line.trim_matches(|c| c == '─' || c == ' ' || c == '\r' || c == '\n');
+            if !trimmed.is_empty() {
+                seen.insert(trimmed);
+            }
+        }
+    }
+    seen.len()
+}
+
 fn log_session_start() {
     use windows::Win32::System::SystemInformation::GetSystemTime;
     use windows::Win32::Foundation::SYSTEMTIME;
@@ -52,12 +71,32 @@ fn log_session_start() {
         Some(dir) => dir.join("gatejumper.log"),
         None => std::path::PathBuf::from("gatejumper.log"),
     };
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
-        let _ = writeln!(file,
-            "\n{} {:04}-{:02}-{:02} {:02}:{:02}:{:02} {}",
+    let deferred_path = match DLL_DIRECTORY.get() {
+        Some(dir) => dir.join("gatejumper-deferred.log"),
+        None => std::path::PathBuf::from("gatejumper-deferred.log"),
+    };
+
+    let time_str = format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
+    );
+
+    if let Ok(content) = std::fs::read_to_string(&log_path) {
+        if content.contains(&time_str) {
+            return;
+        }
+        if count_launch_entries(&content) >= MAX_LAUNCH_ENTRIES {
+            let _ = std::fs::remove_file(&log_path);
+            let _ = std::fs::remove_file(&deferred_path);
+        }
+    }
+
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
+        let _ = writeln!(
+            file,
+            "\n{} {} {}",
             "─".repeat(35),
-            st.wYear, st.wMonth, st.wDay,
-            st.wHour, st.wMinute, st.wSecond,
+            time_str,
             "─".repeat(35),
         );
     }
@@ -65,29 +104,12 @@ fn log_session_start() {
 
 // --- Configuration ---
 //
-// The `gatejumper.ini` beside dmmhook.dll (the dedicated GateJumper folder,
-// which DMM never touches) drives everything:
-//
-//   [main]
-//   dmm = true
-//   target = <DMM Game Player install directory>   # consumed by the injector
-//
-//   [ExampleGame.exe]
-//   dir = <game directory>
-//   plugins = true            # optional; omit to load if plugins/ exists
-//
-//   [AnotherGame.exe]
-//   dir = <game directory>
-//   plugins = false           # disable plugin loading for this game
-//
-// The config is parsed exactly once when the DLL loads. On every process spawn
-// the launched game is matched against it: a `gatejumper.ini` living inside the
-// game's own directory wins outright; otherwise the `[<exe name>]` section of
-// this file applies (its `dir`, when present, must match where the
-// process actually launched from). A game with no config entry at all is
-// launched normally — no injection, no bypass, no mod loading — unless its own
-// directory contains a `gatejumper.dll` (a standalone install that DMM now
-// launches), which counts as an implicit match.
+// `gatejumper.ini` beside dmmhook.dll (the GateJumper folder DMM never touches)
+// drives everything: `[main]` for the injector, one `[<exe>]` section per armed
+// game (`dir`, `plugins`). Parsed once at DLL load. A spawn matches its own
+// game-dir gatejumper.ini first, then the global section (dir, when present,
+// must match), else an in-game gatejumper.dll counts as implicit; anything
+// else launches untouched.
 
 #[derive(Clone, Debug, Default)]
 struct GameEntry {
@@ -206,22 +228,68 @@ fn parse_config(content: &str) -> HookConfig {
     cfg
 }
 
-/// Compare two directory paths case-insensitively, normalizing slashes and
-/// trailing separators. A Linux-style absolute target (`/media/…`) is mapped
-/// through the prefix's `Z:` drive first, so it compares equal to the Windows
-/// path (`Z:\media\…`) that Wine reports for the spawned process.
-fn dirs_equal(a: &Path, b: &Path) -> bool {
-    let norm = |p: &Path| -> String {
-        let s = p.to_string_lossy();
-        let s = if s.starts_with('/') {
-            format!("Z:\\{}", s.trim_start_matches('/'))
-        } else {
-            s.to_string()
-        };
-        s.replace('/', "\\").trim_end_matches('\\').to_ascii_lowercase()
-    };
-    norm(a) == norm(b)
+/// Normalized aliases of a path — slashes folded, lowercased — plus the
+/// spellings Wine/prefix managers (Steam, Bottles, Lutris, Faugus) use for the
+/// same location: `Z:` for a Unix absolute path, and `drive_<letter>` segments
+/// mapped to `<letter>:\…`.
+fn path_variants(path: &str) -> Vec<String> {
+    let s = path.replace('/', "\\").to_ascii_lowercase();
+    let t = s.trim_end_matches('\\').to_string();
+    let mut out = vec![t.clone()];
+    if t.starts_with('\\') {
+        // Lowercase to match the lowercased base form — variants are compared
+        // literally and must agree on case.
+        out.push(format!("z:{}", t));
+    }
+    if let Some(idx) = t.find("\\drive_") {
+        let rest = &t[idx + 7..]; // past "\drive_"
+        let b = rest.as_bytes();
+        if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b'\\' {
+            out.push(format!("{}:{}", b[0] as char, &rest[1..]));
+        }
+    }
+    out
 }
+
+/// True when any normalized alias of `a` equals any alias of `b`.
+fn dirs_equal(a: &Path, b: &Path) -> bool {
+    let av = path_variants(&a.to_string_lossy());
+    let bv = path_variants(&b.to_string_lossy());
+    av.iter().any(|x| bv.contains(x))
+}
+
+// --- Carrier propagation (DMM Fast Launcher) ---
+
+/// Interpreters a launcher may put between itself and the game (DMM Fast
+/// Launcher: `subprocess.Popen(shell=True)` → `cmd.exe /c …`). The hook chain
+/// doesn't survive into unarmed children, so the carrier must be armed.
+fn is_carrier_exe(exe_name: &str) -> bool {
+    matches!(exe_name, "cmd.exe" | "powershell.exe" | "pwsh.exe")
+}
+
+/// Does this lowercased command line reference an armed game? Name-based so
+/// Windows and Wine/prefix spellings behave alike; the authoritative `dir`
+/// match still happens on the game's own spawn.
+fn config_carries_game(cfg: &HookConfig, cmd_lower: &str) -> bool {
+    !cfg.games.is_empty() && cfg.games.iter().any(|(name, _)| cmd_lower.contains(name.as_str()))
+}
+
+fn command_line_carries_game(cmd_lower: &str) -> bool {
+    HOOK_CONFIG.get().map(|cfg| config_carries_game(cfg, cmd_lower)).unwrap_or(false)
+}
+
+/// A same-name, same-directory spawn is the launcher's own runtime child
+/// (PyInstaller one-file re-executes itself as the real process); the hook
+/// chain must follow it or every launch it performs goes unseen.
+fn is_own_image(exe_name: &str, exe_dir: &Path) -> bool {
+    OWN_IMAGE.get()
+        .map(|(n, d)| n == exe_name && dirs_equal(d, exe_dir))
+        .unwrap_or(false)
+}
+
+/// Cap on carriers one hooked process may arm.
+static CARRIER_ARMS: AtomicU32 = AtomicU32::new(0);
+const MAX_CARRIER_ARMS: u32 = 3;
 
 /// Result of matching a spawned game against the configuration.
 struct MatchResult {
@@ -450,6 +518,169 @@ fn process_identity(
     Some((name, dir))
 }
 
+// --- Shellcode construction ---
+
+/// Byte offsets of the shellcode's critical instructions, for verification.
+#[derive(Debug, Default)]
+struct ShellcodeLayout {
+    /// `lea r9, [rsp+0x20]` — old-protect slot for the first VirtualProtect.
+    vp1_lea: usize,
+    /// Index of the `call rax` ending the first VirtualProtect sequence.
+    vp1_call: usize,
+    /// `mov [rax], rcx` — first half of the OEP byte write-back (0x5D).
+    oep_write: usize,
+    /// `lea r9, [rsp+0x24]` — old-protect slot for the second VirtualProtect.
+    vp2_lea: usize,
+    /// `call SetEnvironmentVariableA` — 0 when no plugins override is set.
+    setenv_call: usize,
+    /// Operand slots patched with the payload path / env string addresses.
+    dll_path_operand: usize,
+    env_name_operand: usize,
+    env_value_operand: usize,
+}
+
+/// Assemble the OEP-injection shellcode: save regs → OEP page writable →
+/// restore the original 16 OEP bytes → protect again → optional
+/// SetEnvironmentVariableA(GATEJUMPER_LOAD_PLUGINS) → LoadLibraryA(payload) →
+/// restore regs → jump to OEP. The VirtualProtect old-protect slots live on
+/// our own stack at [rsp+0x20, +0x28) — never in the RX shellcode page (that
+/// out-pointer was the 0xC0000005 bug).
+fn build_injection_shellcode(
+    oep_addr: usize,
+    virtual_protect_addr: usize,
+    load_lib_addr: usize,
+    setenv_addr: Option<usize>,
+    orig_0_7: u64,
+    orig_8_15: u64,
+) -> (Vec<u8>, ShellcodeLayout) {
+    let mut sc: Vec<u8> = Vec::new();
+    let mut l = ShellcodeLayout::default();
+    // Save all registers.
+    sc.extend_from_slice(&[0x55,0x53,0x51,0x52,0x56,0x57,
+        0x41,0x50,0x41,0x51,0x41,0x52,0x41,0x53,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57]);
+    // mov rbp,rsp / and rsp,~0xF / sub rsp,0x40 — frame covers the old-protect slots.
+    sc.extend_from_slice(&[0x48,0x89,0xE5, 0x48,0x83,0xE4,0xF0, 0x48,0x83,0xEC,0x40]);
+    // VirtualProtect(oep, 16, PAGE_EXECUTE_READWRITE, &old); rcx = oep_addr.
+    sc.extend_from_slice(&[0x48,0xB9]); sc.extend_from_slice(&(oep_addr as u64).to_le_bytes());
+    // rdx = 16
+    sc.extend_from_slice(&[0x48,0xC7,0xC2, 0x10,0x00,0x00,0x00]);
+    // r8d = 0x40 (PAGE_EXECUTE_READWRITE)
+    sc.extend_from_slice(&[0x41,0xB8, 0x40,0x00,0x00,0x00]);
+    // lea r9, [rsp+0x20] — old-protect slot on our own stack (writable).
+    l.vp1_lea = sc.len();
+    sc.extend_from_slice(&[0x4C,0x8D,0x4C,0x24,0x20]);
+    // call VirtualProtect
+    sc.extend_from_slice(&[0x48,0xB8]); sc.extend_from_slice(&(virtual_protect_addr as u64).to_le_bytes());
+    l.vp1_call = sc.len();
+    sc.extend_from_slice(&[0xFF,0xD0]);
+    // Restore the original 16 OEP bytes (rcx was clobbered; reload rax).
+    sc.extend_from_slice(&[0x48,0xB8]); sc.extend_from_slice(&(oep_addr as u64).to_le_bytes()); // mov rax, oep_addr
+    sc.extend_from_slice(&[0x48,0xB9]); sc.extend_from_slice(&orig_0_7.to_le_bytes());
+    l.oep_write = sc.len();
+    sc.extend_from_slice(&[0x48,0x89,0x08]);  // mov [rax], rcx
+    sc.extend_from_slice(&[0x48,0xB9]); sc.extend_from_slice(&orig_8_15.to_le_bytes());
+    sc.extend_from_slice(&[0x48,0x89,0x48,0x08]); // mov [rax+8], rcx
+    // VirtualProtect(oep, 16, PAGE_EXECUTE_READ, &old) — restore protection.
+    sc.extend_from_slice(&[0x48,0xB9]); sc.extend_from_slice(&(oep_addr as u64).to_le_bytes());
+    sc.extend_from_slice(&[0x48,0xC7,0xC2, 0x10,0x00,0x00,0x00]);
+    sc.extend_from_slice(&[0x41,0xB8, 0x20,0x00,0x00,0x00]); // r8d = PAGE_EXECUTE_READ
+    // lea r9, [rsp+0x24] — second slot.
+    l.vp2_lea = sc.len();
+    sc.extend_from_slice(&[0x4C,0x8D,0x4C,0x24,0x24]);
+    sc.extend_from_slice(&[0x48,0xB8]); sc.extend_from_slice(&(virtual_protect_addr as u64).to_le_bytes());
+    sc.extend_from_slice(&[0xFF,0xD0]);
+
+    // Call SetEnvironmentVariableA for GATEJUMPER_LOAD_PLUGINS when plugins is explicitly overridden.
+    if let Some(sea) = setenv_addr {
+        sc.extend_from_slice(&[0x48,0xB9]); // mov rcx, <name addr>
+        l.env_name_operand = sc.len();
+        sc.extend_from_slice(&[0u8; 8]);
+        sc.extend_from_slice(&[0x48,0xBA]); // mov rdx, <value addr>
+        l.env_value_operand = sc.len();
+        sc.extend_from_slice(&[0u8; 8]);
+        sc.extend_from_slice(&[0x48,0xB8]); sc.extend_from_slice(&(sea as u64).to_le_bytes());
+        l.setenv_call = sc.len();
+        sc.extend_from_slice(&[0xFF,0xD0]); // call SetEnvironmentVariableA
+    }
+
+    // LoadLibraryA(dll_path).
+    sc.extend_from_slice(&[0x48,0xB9]);
+    l.dll_path_operand = sc.len();
+    sc.extend_from_slice(&[0u8; 8]);
+    sc.extend_from_slice(&[0x48,0xB8]); sc.extend_from_slice(&(load_lib_addr as u64).to_le_bytes());
+    sc.extend_from_slice(&[0xFF,0xD0]);
+    // Restore stack, pop all registers.
+    sc.extend_from_slice(&[0x48,0x89,0xEC]);
+    sc.extend_from_slice(&[0x41,0x5F,0x41,0x5E,0x41,0x5D,0x41,0x5C,
+        0x41,0x5B,0x41,0x5A,0x41,0x59,0x41,0x58,0x5F,0x5E,0x5A,0x59,0x5B,0x5D]);
+    // JMP to restored OEP.
+    sc.extend_from_slice(&[0x48,0xB8]); sc.extend_from_slice(&(oep_addr as u64).to_le_bytes());
+    sc.extend_from_slice(&[0xFF,0xE0]);
+    (sc, l)
+}
+
+/// Assert the byte-count invariants, on every injection: a drifted shellcode
+/// must fail here, not as a 0xC0000005 in the game.
+fn verify_injection_shellcode(sc: &[u8], l: &ShellcodeLayout) {
+    // Prologue contains no addresses — exact offsets are safe; drift shifts landmarks.
+    assert!(sc.len() >= 33, "injection shellcode truncated ({} bytes)", sc.len());
+    assert_eq!(&sc[0..6], &[0x55,0x53,0x51,0x52,0x56,0x57], "register-push prologue changed");
+    assert_eq!(&sc[6..22], &[0x41,0x50,0x41,0x51,0x41,0x52,0x41,0x53,
+                             0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57], "REX push prologue changed");
+    assert_eq!(&sc[22..33], &[0x48,0x89,0xE5,0x48,0x83,0xE4,0xF0,0x48,0x83,0xEC,0x40],
+        "stack-frame setup changed");
+    // Frame must cover the old-protect slots at [rsp+0x20, +0x28).
+    let frame = sc[32] as usize;
+    assert!(frame >= 0x28, "stack frame 0x{:02X} does not cover the old-protect slots", frame);
+
+    // Byte-exact lea encodings: a wrong ModRM (r12 vs r9) is the shipped bug.
+    assert_eq!(&sc[l.vp1_lea..l.vp1_lea + 5], &[0x4C,0x8D,0x4C,0x24,0x20], "first old-protect lea changed");
+    assert_eq!(&sc[l.vp2_lea..l.vp2_lea + 5], &[0x4C,0x8D,0x4C,0x24,0x24], "second old-protect lea changed");
+    // Each lea must feed `mov rax, imm64; call rax` directly.
+    assert_eq!(&sc[l.vp1_lea + 5..l.vp1_lea + 7], &[0x48,0xB8], "first lea no longer feeds mov rax");
+    assert_eq!(&sc[l.vp1_lea + 15..l.vp1_lea + 17], &[0xFF,0xD0], "first VirtualProtect call moved");
+    assert_eq!(&sc[l.vp2_lea + 5..l.vp2_lea + 7], &[0x48,0xB8], "second lea no longer feeds mov rax");
+    assert_eq!(&sc[l.vp2_lea + 15..l.vp2_lea + 17], &[0xFF,0xD0], "second VirtualProtect call moved");
+
+    // Phase order: writable → write-back → protection restore.
+    assert!(l.vp1_call < l.oep_write && l.oep_write < l.vp2_lea,
+        "shellcode phase order changed (vp1_call={}, oep_write={}, vp2_lea={})",
+        l.vp1_call, l.oep_write, l.vp2_lea);
+    // The OEP write-back pair with its `mov rcx, imm64` reloads in between.
+    assert_eq!(&sc[l.oep_write..l.oep_write + 3], &[0x48,0x89,0x08], "mov [rax], rcx changed");
+    assert_eq!(&sc[l.oep_write + 13..l.oep_write + 17], &[0x48,0x89,0x48,0x08], "mov [rax+8], rcx changed");
+
+    // Operand slots must sit behind their mov opcodes, inside the buffer.
+    assert!(l.dll_path_operand >= 2 && l.dll_path_operand + 8 <= sc.len(), "dll-path operand out of range");
+    assert_eq!(&sc[l.dll_path_operand - 2..l.dll_path_operand], &[0x48,0xB9], "dll-path operand not behind mov rcx");
+    if l.setenv_call != 0 {
+        assert_eq!(&sc[l.setenv_call..l.setenv_call + 2], &[0xFF,0xD0], "setenv call changed");
+        assert_eq!(&sc[l.env_name_operand - 2..l.env_name_operand], &[0x48,0xB9], "env-name operand not behind mov rcx");
+        assert_eq!(&sc[l.env_value_operand - 2..l.env_value_operand], &[0x48,0xBA], "env-value operand not behind mov rdx");
+        assert!(l.env_value_operand + 8 <= sc.len(), "env-value operand out of range");
+        assert!(l.oep_write < l.env_name_operand && l.env_name_operand < l.dll_path_operand,
+            "setenv stage not between OEP restore and LoadLibrary");
+    } else {
+        assert_eq!(l.env_name_operand, 0, "env operand recorded without setenv_addr");
+        assert_eq!(l.env_value_operand, 0, "env operand recorded without setenv_addr");
+    }
+
+    // Epilogue: mov rbp,rsp then the pops; tail ends with jmp rax.
+    assert!(sc.len() >= 37 + 12, "shellcode too short for epilogue check");
+    assert_eq!(&sc[sc.len() - 37..sc.len() - 34], &[0x48,0x89,0xEC], "mov rbp,rsp epilogue changed");
+    assert_eq!(&sc[sc.len() - 2..], &[0xFF,0xE0], "shellcode does not end with jmp rax");
+}
+
+/// 16-byte OEP trampoline (`mov rax,imm64; call rax; nop×4`): must match the
+/// 16-byte restore exactly — an 18-byte form left 2 OEP bytes as NOPs.
+fn build_trampoline(shellcode_addr: usize) -> Vec<u8> {
+    let mut t: Vec<u8> = Vec::new();
+    t.extend_from_slice(&[0x48,0xB8]); t.extend_from_slice(&(shellcode_addr as u64).to_le_bytes());
+    t.extend_from_slice(&[0xFF,0xE0,0x90,0x90,0x90,0x90]);
+    assert_eq!(t.len(), 16, "OEP trampoline must be exactly 16 bytes");
+    t
+}
+
 // --- OEP injection ---
 
 unsafe fn inject_into_suspended_process(pi: &PROCESS_INFORMATION, plugins: Option<bool>) -> bool {
@@ -481,10 +712,8 @@ unsafe fn inject_into_suspended_process(pi: &PROCESS_INFORMATION, plugins: Optio
     let orig_0_7  = u64::from_le_bytes(orig[0..8].try_into().unwrap());
     let orig_8_15 = u64::from_le_bytes(orig[8..16].try_into().unwrap());
 
-    // Resolve LoadLibraryA, VirtualProtect (and, for plugins override,
-    // SetEnvironmentVariableA) via local kernel32 offsets — avoids remote
-    // module enumeration. System DLLs map at the same base in every process,
-    // so the local base + export offset holds in the child too.
+    // Resolve kernel32 exports via local offsets — system DLLs map at the same
+    // base in every process, so no remote module enumeration is needed.
     let k32 = GetModuleHandleA(PCSTR(b"kernel32.dll\0".as_ptr())).unwrap();
     let lla = GetProcAddress(k32, PCSTR(b"LoadLibraryA\0".as_ptr())).unwrap();
     let load_lib_addr = k32.0 as usize + (lla as usize - k32.0 as usize);
@@ -498,12 +727,9 @@ unsafe fn inject_into_suspended_process(pi: &PROCESS_INFORMATION, plugins: Optio
         None
     };
 
-    // The payload is loaded by absolute path from this DLL's own directory so
-    // the whole GateJumper folder can live anywhere — DMM wipes both its own
-    // directory and the game's directory on updates, so nothing may depend on
-    // files sitting next to the launcher or next to the game. Fall back to the
-    // bare filename (loader search, i.e. the game directory) only when
-    // gatejumper.dll is not found beside dmmhook.dll.
+    // Load the payload by absolute path from this DLL's own folder (DMM wipes
+    // both its own and the game's directory on updates); fall back to loader
+    // search (the game directory) only when it's not beside dmmhook.dll.
     let payload_path: Option<std::path::PathBuf> = DLL_DIRECTORY.get()
         .map(|dir| dir.join("gatejumper.dll"))
         .filter(|p| p.is_file());
@@ -518,96 +744,30 @@ unsafe fn inject_into_suspended_process(pi: &PROCESS_INFORMATION, plugins: Optio
         }
     };
 
-    let mut sc: Vec<u8> = Vec::new();
-    // Save all registers.
-    sc.extend_from_slice(&[0x55,0x53,0x51,0x52,0x56,0x57,
-        0x41,0x50,0x41,0x51,0x41,0x52,0x41,0x53,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57]);
-    // Align stack and reserve shadow space before any calls.
-    // mov rbp, rsp  /  and rsp, ~0xF  /  sub rsp, 0x20
-    sc.extend_from_slice(&[0x48,0x89,0xE5, 0x48,0x83,0xE4,0xF0, 0x48,0x83,0xEC,0x20]);
-    // VirtualProtect(oep_addr, 16, PAGE_EXECUTE_READWRITE=0x40, &old_protect).
-    // rcx = oep_addr
-    sc.extend_from_slice(&[0x48,0xB9]); sc.extend_from_slice(&(oep_addr as u64).to_le_bytes());
-    // rdx = 16
-    sc.extend_from_slice(&[0x48,0xC7,0xC2, 0x10,0x00,0x00,0x00]);
-    // r8d = 0x40 (PAGE_EXECUTE_READWRITE)
-    sc.extend_from_slice(&[0x41,0xB8, 0x40,0x00,0x00,0x00]);
-    // r9 = &old_protect_slot (placeholder, patched after alloc)
-    sc.extend_from_slice(&[0x49,0xB9]);
-    let vp_old_protect_operand_1 = sc.len();
-    sc.extend_from_slice(&[0u8; 8]);
-    // call VirtualProtect
-    sc.extend_from_slice(&[0x48,0xB8]); sc.extend_from_slice(&(virtual_protect_addr as u64).to_le_bytes());
-    sc.extend_from_slice(&[0xFF,0xD0]);
-    // Restore original 16 bytes at OEP (page is now writable).
-    // rcx is caller-saved and clobbered by the VirtualProtect call; reload oep_addr into rax.
-    sc.extend_from_slice(&[0x48,0xB8]); sc.extend_from_slice(&(oep_addr as u64).to_le_bytes()); // mov rax, oep_addr
-    sc.extend_from_slice(&[0x48,0xB9]); sc.extend_from_slice(&orig_0_7.to_le_bytes());
-    sc.extend_from_slice(&[0x48,0x89,0x08]);  // mov [rax], rcx
-    sc.extend_from_slice(&[0x48,0xB9]); sc.extend_from_slice(&orig_8_15.to_le_bytes());
-    sc.extend_from_slice(&[0x48,0x89,0x48,0x08]); // mov [rax+8], rcx
-    // VirtualProtect(oep_addr, 16, PAGE_EXECUTE_READ=0x20, &old_protect) — restore protection.
-    sc.extend_from_slice(&[0x48,0xB9]); sc.extend_from_slice(&(oep_addr as u64).to_le_bytes());
-    sc.extend_from_slice(&[0x48,0xC7,0xC2, 0x10,0x00,0x00,0x00]);
-    sc.extend_from_slice(&[0x41,0xB8, 0x20,0x00,0x00,0x00]); // r8d = PAGE_EXECUTE_READ
-    sc.extend_from_slice(&[0x49,0xB9]);
-    let vp_old_protect_operand_2 = sc.len();
-    sc.extend_from_slice(&[0u8; 8]);
-    sc.extend_from_slice(&[0x48,0xB8]); sc.extend_from_slice(&(virtual_protect_addr as u64).to_le_bytes());
-    sc.extend_from_slice(&[0xFF,0xD0]);
+    let (mut sc, layout) =
+        build_injection_shellcode(oep_addr, virtual_protect_addr, load_lib_addr, setenv_addr,
+                                  orig_0_7, orig_8_15);
+    verify_injection_shellcode(&sc, &layout);
 
-    // Call SetEnvironmentVariableA for GATEJUMPER_LOAD_PLUGINS when plugins is explicitly overridden.
-    let mut env_plugins_name_operand  = 0usize;
-    let mut env_plugins_value_operand = 0usize;
-    if let Some(sea) = setenv_addr {
-        sc.extend_from_slice(&[0x48,0xB9]); // mov rcx, <name addr>
-        env_plugins_name_operand = sc.len();
-        sc.extend_from_slice(&[0u8; 8]);
-        sc.extend_from_slice(&[0x48,0xBA]); // mov rdx, <value addr>
-        env_plugins_value_operand = sc.len();
-        sc.extend_from_slice(&[0u8; 8]);
-        sc.extend_from_slice(&[0x48,0xB8]); sc.extend_from_slice(&(sea as u64).to_le_bytes());
-        sc.extend_from_slice(&[0xFF,0xD0]); // call SetEnvironmentVariableA
-    }
-
-    // LoadLibraryA(dll_path).
-    sc.extend_from_slice(&[0x48,0xB9]);
-    let dll_path_operand = sc.len();
-    sc.extend_from_slice(&[0u8; 8]);
-    sc.extend_from_slice(&[0x48,0xB8]); sc.extend_from_slice(&(load_lib_addr as u64).to_le_bytes());
-    sc.extend_from_slice(&[0xFF,0xD0]);
-    // Restore stack, pop all registers.
-    sc.extend_from_slice(&[0x48,0x89,0xEC]);
-    sc.extend_from_slice(&[0x41,0x5F,0x41,0x5E,0x41,0x5D,0x41,0x5C,
-        0x41,0x5B,0x41,0x5A,0x41,0x59,0x41,0x58,0x5F,0x5E,0x5A,0x59,0x5B,0x5D]);
-    // JMP to restored OEP.
-    sc.extend_from_slice(&[0x48,0xB8]); sc.extend_from_slice(&(oep_addr as u64).to_le_bytes());
-    sc.extend_from_slice(&[0xFF,0xE0]);
+    let dll_path_operand          = layout.dll_path_operand;
+    let env_plugins_name_operand  = layout.env_name_operand;
+    let env_plugins_value_operand = layout.env_value_operand;
 
     // Allocate RW, write shellcode, then promote to RX — never EXECUTE_READWRITE.
     let plugins_env_name  = "GATEJUMPER_LOAD_PLUGINS\0";
     let plugins_env_value: String = plugins.map(|v| if v { "1\0".to_string() } else { "0\0".to_string() }).unwrap_or_default();
 
+    // Data (path + env strings) share the RX page; old-protect slots are on the stack.
     let path_offset           = (sc.len() + 7) & !7;
     let plugins_name_offset   = path_offset + dll_path.len();
     let plugins_value_offset  = plugins_name_offset + plugins_env_name.len();
-    let old_protect_1_offset  = (plugins_value_offset + plugins_env_value.len() + 7) & !7;
-    let old_protect_2_offset  = old_protect_1_offset + 4;
-    let alloc_size            = old_protect_2_offset + 4;
+    let alloc_size            = plugins_value_offset + plugins_env_value.len();
 
     let alloc = VirtualAllocEx(
         pi.hProcess, None, alloc_size,
         MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE,
     );
     if alloc.is_null() { log("VirtualAllocEx failed."); return false; }
-
-    // Patch VirtualProtect old_protect operands — each into its own slot.
-    let old_protect_1_addr = alloc as usize + old_protect_1_offset;
-    let old_protect_2_addr = alloc as usize + old_protect_2_offset;
-    sc[vp_old_protect_operand_1..vp_old_protect_operand_1 + 8]
-        .copy_from_slice(&(old_protect_1_addr as u64).to_le_bytes());
-    sc[vp_old_protect_operand_2..vp_old_protect_operand_2 + 8]
-        .copy_from_slice(&(old_protect_2_addr as u64).to_le_bytes());
 
     let dll_path_addr = alloc as usize + path_offset;
     sc[dll_path_operand..dll_path_operand + 8].copy_from_slice(&(dll_path_addr as u64).to_le_bytes());
@@ -634,9 +794,7 @@ unsafe fn inject_into_suspended_process(pi: &PROCESS_INFORMATION, plugins: Optio
     let _ = VirtualProtectEx(pi.hProcess, alloc, sc.len(), PAGE_EXECUTE_READ, &mut old);
 
     // Patch OEP: temporarily RW, write trampoline, restore RX.
-    let mut tramp: Vec<u8> = Vec::new();
-    tramp.extend_from_slice(&[0x48,0xB8]); tramp.extend_from_slice(&(alloc as u64).to_le_bytes());
-    tramp.extend_from_slice(&[0xFF,0xE0,0x90,0x90,0x90,0x90,0x90,0x90]);
+    let tramp: Vec<u8> = build_trampoline(alloc as usize);
 
     let _ = VirtualProtectEx(pi.hProcess, oep_addr as *mut c_void, 16, PAGE_READWRITE, &mut old);
     let _ = WriteProcessMemory(pi.hProcess, oep_addr as *mut c_void,
@@ -646,6 +804,52 @@ unsafe fn inject_into_suspended_process(pi: &PROCESS_INFORMATION, plugins: Optio
     match plugins {
         Some(l) => log(&format!("OEP hijacked (GATEJUMPER_LOAD_PLUGINS={}).", if l { "1" } else { "0" })),
         None    => log("OEP hijacked."),
+    }
+    true
+}
+
+// --- Carrier injection ---
+
+/// Arm a carrier with a plain `LoadLibraryA` APC of this DLL — it fires when
+/// the suspended thread resumes, before the interpreter's entry point, so its
+/// CreateProcessW runs through our hooks. Carriers aren't games: no shellcode.
+unsafe fn arm_carrier_via_apc(pi: &PROCESS_INFORMATION) -> bool {
+    let dll_path: String = match DLL_DIRECTORY.get()
+        .map(|d| d.join("dmmhook.dll"))
+        .filter(|p| p.is_file())
+    {
+        Some(p) => format!("{}\0", p.display()),
+        None => {
+            log("Carrier arming: dmmhook.dll not found beside this hook; refusing.");
+            return false;
+        }
+    };
+    let bytes = dll_path.as_bytes();
+    let alloc = VirtualAllocEx(pi.hProcess, None, bytes.len(), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if alloc.is_null() {
+        log("Carrier arming: VirtualAllocEx failed.");
+        return false;
+    }
+    let mut written = 0usize;
+    if WriteProcessMemory(pi.hProcess, alloc, bytes.as_ptr() as *const c_void, bytes.len(), Some(&mut written)).is_err()
+        || written != bytes.len()
+    {
+        log("Carrier arming: WriteProcessMemory failed.");
+        return false;
+    }
+    // kernel32 maps at one base per session — local export address holds.
+    let k32 = GetModuleHandleA(PCSTR(b"kernel32.dll\0".as_ptr())).unwrap();
+    let f = match GetProcAddress(k32, PCSTR(b"LoadLibraryA\0".as_ptr())) {
+        Some(f) => f,
+        None => {
+            log("Carrier arming: GetProcAddress(LoadLibraryA) failed.");
+            return false;
+        }
+    };
+    let apc_fn = std::mem::transmute(f);
+    if QueueUserAPC(apc_fn, pi.hThread, alloc as usize) == 0 {
+        log("Carrier arming: QueueUserAPC failed.");
+        return false;
     }
     true
 }
@@ -700,11 +904,8 @@ unsafe extern "system" fn win_exec_hook(lpCmdLine: PCSTR, uCmdShow: u32) -> u32 
     orig(lpCmdLine, uCmdShow)
 }
 
-// Always spawn suspended so we can identify the process, then inject or resume
-// cleanly. Injection is purely config-driven: only games matching the
-// configuration (a gatejumper.ini inside the game's directory, or a
-// `[<exe name>]` section in the global config) get the payload; everything else
-// launches normally, untouched.
+// Always spawn suspended so the process can be identified, then inject or
+// resume. Injection is config-driven; everything unmatched launches untouched.
 unsafe extern "system" fn create_process_w_hook(
     lpApplicationName: PCWSTR, lpCommandLine: PWSTR,
     lpPA: *const c_void, lpTA: *const c_void,
@@ -712,6 +913,14 @@ unsafe extern "system" fn create_process_w_hook(
     lpCurDir: PCWSTR, lpSI: *const STARTUPINFOW, lpPI: *mut PROCESS_INFORMATION,
 ) -> BOOL {
     let orig: CreateProcessWFn = std::mem::transmute(CREATE_PROCESS_W_ORIG);
+    // Capture the command line up front — CreateProcessW may modify the buffer.
+    let cmd_text: String = if !lpCommandLine.is_null() {
+        lpCommandLine.to_string().unwrap_or_default()
+    } else if !lpApplicationName.is_null() {
+        lpApplicationName.to_string().unwrap_or_default()
+    } else {
+        String::new()
+    };
     let caller_wanted_suspended = (dwFlags & 0x4) != 0;
     let result = orig(lpApplicationName, lpCommandLine, lpPA, lpTA,
         bInherit, dwFlags | 0x4, lpEnv, lpCurDir, lpSI, lpPI);
@@ -729,9 +938,40 @@ unsafe extern "system" fn create_process_w_hook(
                         }
                     }
                     None => {
-                        log(&format!("Game '{}' does not match configuration; launching normally.", exe_name));
-                        if !caller_wanted_suspended {
-                            ResumeThread(pi.hThread);
+                        // Arm the launcher's own runtime child (PyInstaller
+                        // one-file) or interpreters carrying a configured
+                        // game; everything else launches untouched.
+                        let cmd_lower = cmd_text.to_ascii_lowercase();
+                        let same_exe = is_own_image(&exe_name, &exe_dir);
+                        let carrier = is_carrier_exe(&exe_name) && command_line_carries_game(&cmd_lower);
+                        if same_exe || carrier {
+                            let kind = if same_exe { "runtime child (same executable)" } else { "carrier" };
+                            let hop = CARRIER_ARMS.fetch_add(1, Ordering::Relaxed) + 1;
+                            if hop <= MAX_CARRIER_ARMS {
+                                log(&format!(
+                                    "{} '{}' (hop {}): command line '{}'",
+                                    kind, exe_name, hop, cmd_text,
+                                ));
+                                let armed = arm_carrier_via_apc(pi);
+                                if !caller_wanted_suspended {
+                                    ResumeThread(pi.hThread);
+                                }
+                                log(if armed { "Armed; resuming." }
+                                   else { "Arming failed; resuming unarmed." });
+                            } else {
+                                log(&format!(
+                                    "Hop limit ({}) reached; launching '{}' unarmed.",
+                                    MAX_CARRIER_ARMS, exe_name,
+                                ));
+                                if !caller_wanted_suspended {
+                                    ResumeThread(pi.hThread);
+                                }
+                            }
+                        } else {
+                            log(&format!("Game '{}' does not match configuration; launching normally.", exe_name));
+                            if !caller_wanted_suspended {
+                                ResumeThread(pi.hThread);
+                            }
                         }
                     }
                 }
@@ -788,6 +1028,13 @@ unsafe extern "system" fn shell_execute_ex_w_hook(pExecInfo: *mut SHELLEXECUTEIN
     let orig: ShellExecuteExWFn = std::mem::transmute(SHELL_EXECUTE_EX_W_ORIG);
     if pExecInfo.is_null() { return orig(pExecInfo); }
     let info = &*pExecInfo;
+    // Non-"open" verbs (e.g. runas) get real ShellExecute: elevation happens
+    // in the AppInfo service; don't force the launch unelevated.
+    let verb = if !info.lpVerb.0.is_null() { info.lpVerb.to_string().unwrap_or_default() } else { String::new() };
+    if !verb.is_empty() && !verb.eq_ignore_ascii_case("open") {
+        log(&format!("ShellExecuteExW verb '{}' passed through.", verb));
+        return orig(pExecInfo);
+    }
     let file_str   = if !info.lpFile.0.is_null()       { info.lpFile.to_string().unwrap_or_default()       } else { String::new() };
     let params_str = if !info.lpParameters.0.is_null() { info.lpParameters.to_string().unwrap_or_default() } else { String::new() };
     let cmd = format!("\"{}\" {}", file_str, params_str);
@@ -820,6 +1067,12 @@ unsafe extern "system" fn shell_execute_w_hook(
 ) -> HINSTANCE {
     let orig: extern "system" fn(HWND, PCWSTR, PCWSTR, PCWSTR, PCWSTR, i32) -> HINSTANCE =
         std::mem::transmute(SHELL_EXECUTE_W_ORIG);
+    // Non-"open" verbs pass through — see the ShellExecuteExW hook.
+    let verb = if !lpOp.0.is_null() { lpOp.to_string().unwrap_or_default() } else { String::new() };
+    if !verb.is_empty() && !verb.eq_ignore_ascii_case("open") {
+        log(&format!("ShellExecuteW verb '{}' passed through.", verb));
+        return orig(hwnd, lpOp, lpFile, lpParams, lpDir, nShow);
+    }
     let file_str   = if !lpFile.0.is_null()   { lpFile.to_string().unwrap_or_default()   } else { String::new() };
     let params_str = if !lpParams.0.is_null() { lpParams.to_string().unwrap_or_default() } else { String::new() };
     let cmd = format!("\"{}\" {}", file_str, params_str);
@@ -848,6 +1101,13 @@ unsafe extern "system" fn shell_execute_a_hook(
 ) -> HINSTANCE {
     let orig: extern "system" fn(HWND, PCSTR, PCSTR, PCSTR, PCSTR, i32) -> HINSTANCE =
         std::mem::transmute(SHELL_EXECUTE_A_ORIG);
+
+    // Non-"open" verbs pass through — see the ShellExecuteExW hook.
+    let verb = if !lpOp.0.is_null() { lpOp.to_string().unwrap_or_default() } else { String::new() };
+    if !verb.is_empty() && !verb.eq_ignore_ascii_case("open") {
+        log(&format!("ShellExecuteA verb '{}' passed through.", verb));
+        return orig(hwnd, lpOp, lpFile, lpParams, lpDir, nShow);
+    }
 
     // Convert ANSI args to wide strings and route through the W interception path,
     // matching the ShellExecuteW hook so DMM games launched via ShellExecuteA are
@@ -935,6 +1195,19 @@ pub extern "system" fn DllMain(_module: HINSTANCE, reason: u32, _reserved: *mut 
             log_session_start();
             log("=== DMM-Hook loaded ===");
 
+            // Own image identity — used to follow PyInstaller-style runtime children.
+            let mut pbuf = [0u16; 512];
+            let plen = windows::Win32::System::LibraryLoader::GetModuleFileNameW(None, &mut pbuf);
+            if plen > 0 {
+                let p = PathBuf::from(String::from_utf16_lossy(&pbuf[..plen as usize]));
+                if let (Some(n), Some(d)) = (
+                    p.file_name().map(|s| s.to_string_lossy().to_ascii_lowercase()),
+                    p.parent().map(|x| x.to_path_buf()),
+                ) {
+                    let _ = OWN_IMAGE.set((n, d));
+                }
+            }
+
             // Read the multi-game config exactly once.
             let config = DLL_DIRECTORY.get()
                 .map(|d| d.join("gatejumper.ini"))
@@ -955,4 +1228,149 @@ pub extern "system" fn DllMain(_module: HINSTANCE, reason: u32, _reserved: *mut 
         }
     }
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_injection_shellcode, build_trampoline, config_carries_game, dirs_equal,
+        is_carrier_exe, parse_config, path_variants, verify_injection_shellcode,
+    };
+    use std::path::Path;
+
+    // Fixture addresses — imm64 operands the verifier and tests decode again.
+    const OEP: usize = 0x0000_7FF6_0000_1000;
+    const VP: usize = 0x0000_7FF6_1111_0040;
+    const LL: usize = 0x0000_7FF6_2222_0020;
+    const SE: usize = 0x0000_7FF6_3333_00A0;
+    const ORIG_0_7: u64 = 0x0123_4567_89AB_CDEF;
+    const ORIG_8_15: u64 = 0xFEDC_BA98_7654_3210;
+
+    // Hand-derived from the encodings, cross-checked against the shipped fault
+    // offset (oep_write = 0x5D). A failure means the byte count changed: review
+    // the change, then update these consciously.
+    #[test]
+    fn shellcode_layout_without_env_override() {
+        let (sc, l) = build_injection_shellcode(OEP, VP, LL, None, ORIG_0_7, ORIG_8_15);
+        verify_injection_shellcode(&sc, &l);
+        assert_eq!(sc.len(), 209, "shellcode byte count changed");
+        assert_eq!(l.vp1_lea, 56);
+        assert_eq!(l.vp1_call, 71);
+        assert_eq!(l.oep_write, 93);
+        assert_eq!(l.vp2_lea, 133);
+        assert_eq!(l.dll_path_operand, 152);
+        assert_eq!(l.setenv_call, 0);
+        assert_eq!(l.env_name_operand, 0);
+        assert_eq!(l.env_value_operand, 0);
+        // Captured OEP bytes sit where the write-back loads them.
+        assert_eq!(&sc[l.oep_write - 8..l.oep_write], &ORIG_0_7.to_le_bytes());
+        assert_eq!(&sc[l.oep_write + 5..l.oep_write + 13], &ORIG_8_15.to_le_bytes());
+        // Both VirtualProtect calls receive the real function address.
+        assert_eq!(u64::from_le_bytes(sc[l.vp1_lea + 7..l.vp1_lea + 15].try_into().unwrap()), VP as u64);
+        assert_eq!(u64::from_le_bytes(sc[l.vp2_lea + 7..l.vp2_lea + 15].try_into().unwrap()), VP as u64);
+    }
+
+    #[test]
+    fn shellcode_layout_with_env_override() {
+        let (sc, l) = build_injection_shellcode(OEP, VP, LL, Some(SE), ORIG_0_7, ORIG_8_15);
+        verify_injection_shellcode(&sc, &l);
+        assert_eq!(sc.len(), 241, "shellcode byte count changed");
+        assert_eq!(l.env_name_operand, 152);
+        assert_eq!(l.env_value_operand, 162);
+        assert_eq!(l.setenv_call, 180);
+        assert_eq!(l.dll_path_operand, 184);
+        // The SetEnvironmentVariableA address really landed in its operand.
+        assert_eq!(u64::from_le_bytes(sc[l.setenv_call - 8..l.setenv_call].try_into().unwrap()), SE as u64);
+        // Placeholder operand; LoadLibraryA sits right behind its movs.
+        assert_eq!(&sc[l.dll_path_operand..l.dll_path_operand + 8], &[0u8; 8]);
+        assert_eq!(u64::from_le_bytes(sc[l.dll_path_operand + 10..l.dll_path_operand + 18].try_into().unwrap()), LL as u64);
+    }
+
+    /// A corrupted old-protect ModRM (the shipped bug) must be caught.
+    #[test]
+    #[should_panic]
+    fn verify_rejects_the_shipped_modrm_bug() {
+        let (mut sc, l) = build_injection_shellcode(OEP, VP, LL, None, ORIG_0_7, ORIG_8_15);
+        sc[l.vp1_lea + 2] = 0x64; // rm=100 without mod → SIB base r12, not r9
+        verify_injection_shellcode(&sc, &l);
+    }
+
+    /// A shrunk frame (the other half of the shipped bug) must be caught.
+    #[test]
+    #[should_panic]
+    fn verify_rejects_a_frame_that_cannot_hold_the_slots() {
+        let (mut sc, l) = build_injection_shellcode(OEP, VP, LL, None, ORIG_0_7, ORIG_8_15);
+        sc[32] = 0x20; // sub rsp, 0x20 — slots at [rsp+0x20, rsp+0x28) fall outside
+        verify_injection_shellcode(&sc, &l);
+    }
+
+    #[test]
+    fn trampoline_is_exactly_16_bytes() {
+        let t = build_trampoline(0x0000_7FF7_0000_2000);
+        assert_eq!(t.len(), 16);
+        assert_eq!(&t[0..2], &[0x48, 0xB8]);
+        assert_eq!(u64::from_le_bytes(t[2..10].try_into().unwrap()), 0x0000_7FF7_0000_2000);
+        assert_eq!(&t[10..16], &[0xFF, 0xE0, 0x90, 0x90, 0x90, 0x90]);
+    }
+
+    // --- Path resolution across Wine/Proton/prefix-manager layouts ---
+
+    #[test]
+    fn path_variants_cover_prefix_manager_layouts() {
+        // Unix absolute → also reachable through Wine's standard Z: mount of /.
+        assert_eq!(
+            path_variants("/media/Games/ExampleGame"),
+            vec![
+                "\\media\\games\\examplegame".to_string(),
+                "z:\\media\\games\\examplegame".to_string(),
+            ]
+        );
+        // Prefix drive directories → also the letter: view the process sees.
+        let v = path_variants("/home/u/.steam/steam/compatdata/1/pfx/drive_c/games/game");
+        assert!(v.contains(&"c:\\games\\game".to_string()), "{:?}", v);
+        assert!(v.contains(&"z:\\home\\u\\.steam\\steam\\compatdata\\1\\pfx\\drive_c\\games\\game".to_string()), "{:?}", v);
+        // A plain Windows path is its own single variant (trailing slash trimmed).
+        assert_eq!(path_variants("C:\\Games\\Foo\\"), vec!["c:\\games\\foo".to_string()]);
+    }
+
+    #[test]
+    fn dirs_equal_across_representations() {
+        // Config written as a Linux path, process reports Wine's Z: spelling.
+        assert!(dirs_equal(
+            Path::new("/media/Games/ExampleGame"),
+            Path::new("Z:\\media\\games\\ExampleGame")
+        ));
+        // Config written as a Linux prefix path, process reports C:\… (drive_c mapping).
+        assert!(dirs_equal(
+            Path::new("/home/u/bottles/bottles/Game/drive_c/Games/ExampleGame"),
+            Path::new("C:\\Games\\ExampleGame")
+        ));
+        // Different directories still compare unequal — and a drive_c path is
+        // not equal to a different drive letter.
+        assert!(!dirs_equal(Path::new("/media/Games/A"), Path::new("Z:\\media\\games\\B")));
+        assert!(!dirs_equal(Path::new("/x/drive_c/games/a"), Path::new("D:\\games\\a")));
+    }
+
+    // --- Carrier propagation (DMM Fast Launcher) ---
+
+    #[test]
+    fn carrier_predicate_only_matches_interpreters() {
+        assert!(is_carrier_exe("cmd.exe"));
+        assert!(is_carrier_exe("powershell.exe"));
+        assert!(is_carrier_exe("pwsh.exe"));
+        assert!(!is_carrier_exe("game.exe"));
+        assert!(!is_carrier_exe("dmmgameplayer.exe"));
+    }
+
+    #[test]
+    fn carrier_command_line_must_reference_a_configured_game() {
+        let cfg = parse_config("[main]\ndmm = true\n[ExampleGame.exe]\ndir = C:\\Games\\ExampleGame\n");
+        assert!(config_carries_game(&cfg, "\"cmd.exe\" /c \"c:\\games\\game\\examplegame.exe\" -screen"));
+        assert!(config_carries_game(&cfg, "examplegame.exe"));
+        assert!(!config_carries_game(&cfg, "cmd.exe /c othergame.exe"));
+        assert!(!config_carries_game(&cfg, ""));
+        // No armed games in the config → nothing can be a carrier payload.
+        let empty = parse_config("[main]\ndmm = true\n");
+        assert!(!config_carries_game(&empty, "examplegame.exe"));
+    }
 }
